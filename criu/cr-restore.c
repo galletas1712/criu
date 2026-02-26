@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include <fcntl.h>
 
@@ -652,8 +653,17 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 		return -1;
 
 	pr_info("T3: open VMAs\n");
-	if (open_vmas(current))
-		return -1;
+	{
+		struct timeval tv0, tv1;
+		gettimeofday(&tv0, NULL);
+		if (open_vmas(current)) {
+			return -1;
+		}
+		gettimeofday(&tv1, NULL);
+		pr_info("open_vmas took %lu ms (virt %d)\n",
+			(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000),
+			vpid(current));
+	}
 
 	if (prepare_aios(current, ta))
 		return -1;
@@ -1731,12 +1741,9 @@ static int attach_to_tasks(bool root_seized)
 		if (!task_alive(item))
 			continue;
 
-		if (item->nr_threads == 1) {
-			item->threads[0].real = item->pid->real;
-		} else {
-			if (parse_threads(item->pid->real, &item->threads, &item->nr_threads))
-				return -1;
-		}
+		/* Parse threads for ptrace attach */
+		if (parse_threads(item->pid->real, &item->threads, &item->nr_threads))
+			return -1;
 
 		for (i = 0; i < item->nr_threads; i++) {
 			pid_t pid = item->threads[i].real;
@@ -1761,7 +1768,8 @@ static int attach_to_tasks(bool root_seized)
 				pr_perror("Unable to set PTRACE_O_TRACESYSGOOD for %d", pid);
 				return -1;
 			}
-			if (arch_ptrace_restore(pid, item))
+			/* Only restore regs for image threads; workers have no core */
+			if (i < item->nr_threads_image && arch_ptrace_restore(pid, item))
 				return -1;
 			/*
 			 * Suspend seccomp if necessary. We need to do this because
@@ -1793,16 +1801,8 @@ static int restore_rseq_cs(void)
 		if (!task_alive(item))
 			continue;
 
-		if (item->nr_threads == 1) {
-			item->threads[0].real = item->pid->real;
-		} else {
-			if (parse_threads(item->pid->real, &item->threads, &item->nr_threads)) {
-				pr_err("restore_rseq_cs: parse_threads failed\n");
-				return -1;
-			}
-		}
-
-		for (i = 0; i < item->nr_threads; i++) {
+		/* threads[] populated by attach_to_tasks; no re-parse needed */
+		for (i = 0; i < item->nr_threads_image; i++) {
 			pid_t pid = item->threads[i].real;
 			struct rst_rseq *rseqe = rsti(item)->rseqe;
 
@@ -1838,13 +1838,7 @@ static int catch_tasks(bool root_seized)
 		if (!task_alive(item))
 			continue;
 
-		if (item->nr_threads == 1) {
-			item->threads[0].real = item->pid->real;
-		} else {
-			if (parse_threads(item->pid->real, &item->threads, &item->nr_threads))
-				return -1;
-		}
-
+		/* threads[] populated by attach_to_tasks; no re-parse needed */
 		for (i = 0; i < item->nr_threads; i++) {
 			pid_t pid = item->threads[i].real;
 
@@ -1921,11 +1915,22 @@ static int finalize_restore_detach(void)
 				continue;
 			}
 
-			if (arch_set_thread_regs_nosigrt(&item->threads[i])) {
-				pr_perror("Restoring regs for %d failed", pid);
-				return -1;
+			/* Restore regs for image threads only */
+			if (i < item->nr_threads_image) {
+				if (arch_set_thread_regs_nosigrt(&item->threads[i])) {
+					if (errno == ESRCH) {
+						pr_warn("Thread %d already exited, skipping\n", pid);
+						continue;
+					}
+					pr_perror("Restoring regs for %d failed", pid);
+					return -1;
+				}
 			}
 			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
+				if (errno == ESRCH) {
+					pr_warn("Thread %d already exited, skipping detach\n", pid);
+					continue;
+				}
 				pr_perror("Unable to detach %d", pid);
 				return -1;
 			}

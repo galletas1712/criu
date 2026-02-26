@@ -25,6 +25,8 @@ struct reg_file_info {
 	bool size_mode_checked;
 	bool is_dir;
 	char *path;
+	/* For remap: cached fd in this process (-1 if not set); one link per file, rest dup. */
+	int remap_cached_fd;
 };
 
 extern int open_reg_by_id(u32 id);
@@ -40,6 +42,8 @@ extern struct file_remap *lookup_ghost_remap(u32 dev, u32 ino);
 extern struct file_desc *try_collect_special_file(u32 id, int optional);
 #define collect_special_file(id) try_collect_special_file(id, 0)
 extern int collect_filemap(struct vma_area *);
+/* Open one file for VMA (open_path path only; for parallel open_vmas). */
+extern int open_file_for_vma(struct vma_area *vma, u32 flags);
 extern void filemap_ctx_init(bool auto_close);
 extern void filemap_ctx_fini(void);
 

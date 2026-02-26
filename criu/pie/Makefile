@@ -29,6 +29,8 @@ endif
 
 LDS		:= compel/arch/$(ARCH)/scripts/compel-pack.lds.S
 
+ccflags-y	+= -iquote $(obj)
+
 restorer-obj-y	+= parasite-vdso.o ./$(ARCH_DIR)/vdso-pie.o
 restorer-obj-y	+= ./$(ARCH_DIR)/restorer.o
 

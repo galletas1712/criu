@@ -1,7 +1,9 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <errno.h>
 #include <linux/falloc.h>
+#include <sys/time.h>
 #include <sys/uio.h>
 #include <limits.h>
 
@@ -531,8 +533,30 @@ static int process_async_reads(struct page_read *pr)
 {
 	int fd, ret = 0;
 	struct page_read_iov *piov, *n;
+	off_t first_off = 0, last_end = 0;
+	bool have_range = false;
+	struct timeval tv0, tv1, tv2;
 
 	fd = img_raw_fd(pr->pi);
+	/* Pre-warm page cache for all async read ranges (fadvise + preadv strategy) */
+	gettimeofday(&tv0, NULL);
+	list_for_each_entry(piov, &pr->async, l) {
+		if (!have_range) {
+			first_off = piov->from;
+			last_end = piov->end;
+			have_range = true;
+		} else {
+			if (piov->from < first_off)
+				first_off = piov->from;
+			if (piov->end > last_end)
+				last_end = piov->end;
+		}
+	}
+	if (have_range && last_end > first_off) {
+		if (posix_fadvise(fd, first_off, (off_t)(last_end - first_off), POSIX_FADV_WILLNEED) != 0)
+			pr_debug("posix_fadvise(WILLNEED) failed for async range\n");
+	}
+	gettimeofday(&tv1, NULL);
 	list_for_each_entry_safe(piov, n, &pr->async, l) {
 		ssize_t ret;
 		struct iovec *iovs = piov->to;
@@ -581,6 +605,13 @@ static int process_async_reads(struct page_read *pr)
 		list_del(&piov->l);
 		xfree(iovs);
 		xfree(piov);
+	}
+	gettimeofday(&tv2, NULL);
+	if (have_range && last_end > first_off) {
+		unsigned long fadv_ms = (unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000);
+		unsigned long preadv_ms = (unsigned long)((tv2.tv_sec - tv1.tv_sec) * 1000 + (tv2.tv_usec - tv1.tv_usec) / 1000);
+		pr_info("pagemap async fadvise %lu ms preadv %lu ms (range %zu MiB)\n",
+			fadv_ms, preadv_ms, (size_t)((last_end - first_off) / (1024 * 1024)));
 	}
 
 	if (pr->parent)
@@ -815,6 +846,20 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	if (!pr->pi) {
 		close_page_read(pr);
 		return -1;
+	}
+
+	{
+		int pfd = img_raw_fd(pr->pi);
+		if (pfd >= 0) {
+			int fl = fcntl(pfd, F_GETFL);
+			if (fl >= 0) {
+				int ret = fcntl(pfd, F_SETFL, fl | O_DIRECT);
+				if (ret < 0)
+					pr_warn("Failed to set O_DIRECT on pages fd %d: %s\n", pfd, strerror(errno));
+				else
+					pr_debug("O_DIRECT enabled on pages fd %d\n", pfd);
+			}
+		}
 	}
 
 	if (init_pagemaps(pr)) {

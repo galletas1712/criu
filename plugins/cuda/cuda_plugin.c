@@ -11,8 +11,11 @@
 #include <compel/infect.h>
 
 #include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
@@ -207,6 +210,37 @@ static int cuda_checkpoint_supports_flag(const char *flag)
 	return 1;
 }
 
+/* Dump thread list and kernel stacks for pid (diagnostic when restore thread not found) */
+static void dump_threads_and_stacks(int pid)
+{
+	DIR *dir;
+	struct dirent *de;
+	char stack_buf[512];
+	FILE *stack_f;
+
+	dir = opendir_proc(pid, "task");
+	if (!dir) {
+		pr_warn("cuda_plugin: could not opendir /proc/%d/task: %s\n", pid, strerror(errno));
+		return;
+	}
+
+	pr_warn("cuda_plugin: pid %d threads and stacks (when restore thread not found):\n", pid);
+	while ((de = readdir(dir))) {
+		if (de->d_name[0] == '.')
+			continue;
+		pr_warn("  TID %s:\n", de->d_name);
+		stack_f = fopen_proc(pid, "task/%s/stack", de->d_name);
+		if (stack_f) {
+			while (fgets(stack_buf, sizeof(stack_buf), stack_f))
+				pr_warn("    %s", stack_buf);
+			fclose(stack_f);
+		} else {
+			pr_warn("    (could not read stack: %s)\n", strerror(errno));
+		}
+	}
+	closedir(dir);
+}
+
 /* Retrieve the cuda restore thread TID from the root pid */
 static int get_cuda_restore_tid(int root_pid)
 {
@@ -219,6 +253,8 @@ static int get_cuda_restore_tid(int root_pid)
 	int ret = launch_cuda_checkpoint(args, pid_out, sizeof(pid_out));
 	if (ret != 0) {
 		pr_err("Failed to launch cuda-checkpoint to retrieve restore tid: %s\n", pid_out);
+		if (strstr(pid_out, "Could not find restore thread") != NULL)
+			dump_threads_and_stacks(root_pid);
 		return -1;
 	}
 

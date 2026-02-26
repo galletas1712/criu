@@ -610,6 +610,7 @@ static int read_one_pstree_item(struct cr_img *img, pid_t *pid_max)
 	}
 
 	pi->nr_threads = e->n_threads;
+	pi->nr_threads_image = e->n_threads;
 	pi->threads = xmalloc(e->n_threads * sizeof(struct pid));
 	if (!pi->threads)
 		goto err;

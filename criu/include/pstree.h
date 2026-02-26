@@ -22,8 +22,9 @@ struct pstree_item {
 	pid_t sid;
 	pid_t born_sid;
 
-	int nr_threads;	     /* number of threads */
-	struct pid *threads; /* array of threads */
+	int nr_threads;	     /* number of threads (from parse_threads; must equal nr_threads_image) */
+	int nr_threads_image; /* from image; rseqe/core arrays are this size; never modified */
+	struct pid *threads;  /* array of threads */
 	CoreEntry **core;
 	TaskKobjIdsEntry *ids;
 	union {

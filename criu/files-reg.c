@@ -88,17 +88,26 @@ static LIST_HEAD(ghost_files);
  * target, then open one, then unlink. In case the remap
  * source has more than one instance, these three steps
  * should be serialized with each other.
+ * Per-rfi lock: only same-file opens serialize; different files open in parallel.
  */
-static mutex_t *remap_open_lock;
+struct remap_rfi_lock {
+	struct list_head list;
+	u32 id;
+	mutex_t *m;
+};
 
-static inline int init_remap_lock(void)
+static struct list_head *remap_rfi_locks_head;
+
+static mutex_t *get_remap_lock(u32 rfi_id)
 {
-	remap_open_lock = shmalloc(sizeof(*remap_open_lock));
-	if (!remap_open_lock)
-		return -1;
+	struct remap_rfi_lock *l;
 
-	mutex_init(remap_open_lock);
-	return 0;
+	if (!remap_rfi_locks_head)
+		return NULL;
+	list_for_each_entry(l, remap_rfi_locks_head, list)
+		if (l->id == rfi_id)
+			return l->m;
+	return NULL;
 }
 
 static LIST_HEAD(remaps);
@@ -807,16 +816,47 @@ out:
 	return ret;
 }
 
+static inline int init_remap_locks(void)
+{
+	struct remap_info *ri;
+	struct remap_rfi_lock *l;
+
+	remap_rfi_locks_head = shmalloc(sizeof(*remap_rfi_locks_head));
+	if (!remap_rfi_locks_head)
+		return -1;
+	INIT_LIST_HEAD(remap_rfi_locks_head);
+
+	list_for_each_entry(ri, &remaps, list) {
+		u32 id = ri->rfi->d.id;
+
+		/* Dedup: same rfi may appear in multiple remap_infos in theory */
+		if (get_remap_lock(id))
+			continue;
+
+		l = shmalloc(sizeof(*l));
+		if (!l)
+			return -1;
+		l->id = id;
+		l->m = shmalloc(sizeof(*l->m));
+		if (!l->m)
+			return -1;
+		mutex_init(l->m);
+		list_add_tail(&l->list, remap_rfi_locks_head);
+	}
+	return 0;
+}
+
 int prepare_remaps(void)
 {
 	struct remap_info *ri;
 	int ret = 0;
 
-	ret = init_remap_lock();
+	ret = init_remap_locks();
 	if (ret)
 		return ret;
 
 	list_for_each_entry(ri, &remaps, list) {
+		ri->rfi->remap_cached_fd = -1;
 		ret = prepare_one_remap(ri);
 		if (ret)
 			break;
@@ -2228,12 +2268,18 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 	}
 
 	if (rfi->remap) {
+		mutex_t *m;
+
 		if (fault_injected(FI_RESTORE_OPEN_LINK_REMAP)) {
 			pr_info("fault: Open link-remap failure!\n");
 			kill(getpid(), SIGKILL);
 		}
 
-		mutex_lock(remap_open_lock);
+		m = get_remap_lock(rfi->d.id);
+		if (!m)
+			goto err;
+		pr_info("open_path remap lock: %s\n", rfi->path);
+		mutex_lock(m);
 		if (rfi->remap->is_dir) {
 			/*
 			 * FIXME Can't make directory under new name.
@@ -2241,18 +2287,30 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 			 */
 			orig_path = rfi->path;
 			rfi->path = rfi->remap->rpath;
-		} else if ((ret = rfi_remap(rfi, &level)) == 1) {
+			mutex_unlock(m);
+			mntns_root = mntns_get_root_by_mnt_id(rfi->rfe->mnt_id);
+			goto ext;
+		}
+		if (rfi->remap_cached_fd >= 0) {
+			tmp = dup(rfi->remap_cached_fd);
+			mutex_unlock(m);
+			if (tmp < 0) {
+				pr_perror("dup remap_cached_fd");
+				return -1;
+			}
+			if (restore_fown(tmp, rfi->rfe->fown)) {
+				close(tmp);
+				return -1;
+			}
+			return tmp;
+		}
+		/*
+		 * First open of this remap in this process: create link,
+		 * open, cache fd, then unlink while still holding the lock.
+		 * Subsequent opens in the same process will dup the cached fd.
+		 */
+		if ((ret = rfi_remap(rfi, &level)) == 1) {
 			static char tmp_path[PATH_MAX];
-
-			/*
-			 * The file whose name we're trying to create
-			 * exists. Need to pick some other one, we're
-			 * going to remove it anyway.
-			 *
-			 * Strictly speaking, this is cheating, file
-			 * name shouldn't change. But since NFS with
-			 * its silly-rename doesn't care, why should we?
-			 */
 
 			orig_path = rfi->path;
 			rfi->path = tmp_path;
@@ -2261,10 +2319,12 @@ int open_path(struct file_desc *d, int (*open_cb)(int mntns_root, struct reg_fil
 
 			if (rfi_remap(rfi, &level)) {
 				pr_perror("Can't create even fake link!");
+				mutex_unlock(m);
 				goto err;
 			}
 		} else if (ret < 0) {
 			pr_perror("Can't link %s -> %s", rfi->remap->rpath, rfi->path);
+			mutex_unlock(m);
 			goto err;
 		}
 	}
@@ -2329,9 +2389,15 @@ ext:
 			}
 			if (rm_parent_dirs(mntns_root, rfi->path, level))
 				goto err;
+
+			rfi->remap_cached_fd = tmp;
 		}
 
-		mutex_unlock(remap_open_lock);
+		{
+			mutex_t *m = get_remap_lock(rfi->d.id);
+			if (m)
+				mutex_unlock(m);
+		}
 	}
 	if (orig_path)
 		rfi->path = orig_path;
@@ -2343,8 +2409,11 @@ ext:
 
 	return tmp;
 err:
-	if (rfi->remap)
-		mutex_unlock(remap_open_lock);
+	if (rfi->remap) {
+		mutex_t *m = get_remap_lock(rfi->d.id);
+		if (m)
+			mutex_unlock(m);
+	}
 	close_safe(&tmp);
 	return -1;
 }
@@ -2532,6 +2601,17 @@ static int open_filemap(int pid, struct vma_area *vma)
 	ctx.vma = vma;
 	vma->e->fd = ctx.fd;
 	return 0;
+}
+
+/*
+ * Open one file for a VMA (normal open_path path only).
+ * Used by parallel open_vmas; does not touch filemap_ctx.
+ * Caller must ensure vma is not VMA_EXT_PLUGIN or VMA_AREA_MEMFD.
+ */
+int open_file_for_vma(struct vma_area *vma, u32 flags)
+{
+	BUG_ON((vma->vmfd == NULL) || !vma->e->has_fdflags);
+	return open_path(vma->vmfd, do_open_reg_noseek_flags, &flags);
 }
 
 int collect_filemap(struct vma_area *vma)

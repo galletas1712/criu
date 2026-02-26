@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <pthread.h>
 
 #include "types.h"
 #include "cr_options.h"
@@ -27,6 +28,7 @@
 #include "bitmap.h"
 #include "sk-packet.h"
 #include "files-reg.h"
+#include "memfd.h"
 #include "pagemap-cache.h"
 #include "fault-injection.h"
 #include "prctl.h"
@@ -1448,14 +1450,121 @@ int unmap_guard_pages(struct pstree_item *t)
 	return 0;
 }
 
+/*
+ * One unique (vmfd, flags) for parallel open. fd is filled by workers.
+ */
+struct open_vma_unique {
+	struct file_desc *vmfd;
+	u32 flags;
+	struct vma_area *rep_vma;
+	int fd;
+	bool is_memfd;
+};
+
+struct open_vma_worker_arg {
+	struct open_vma_unique *unique;
+	int nr_unique;
+	int worker_id;
+	int nworkers;
+	int ret;
+};
+
+static void *open_vma_worker(void *arg_)
+{
+	struct open_vma_worker_arg *arg = arg_;
+	int i;
+
+	arg->ret = 0;
+	for (i = arg->worker_id; i < arg->nr_unique; i += arg->nworkers) {
+		struct open_vma_unique *u = &arg->unique[i];
+		int fd;
+
+		if (u->is_memfd) {
+			if (!inherited_fd(u->vmfd, &fd))
+				fd = memfd_open(u->vmfd, &u->flags, true);
+		} else
+			fd = open_file_for_vma(u->rep_vma, u->flags);
+
+		if (fd < 0) {
+			arg->ret = -1;
+			return NULL;
+		}
+		u->fd = fd;
+	}
+	return NULL;
+}
+
+static int open_vmas_parallel_open(struct open_vma_unique *unique, int nr_unique)
+{
+	int i, nworkers, ret = 0;
+	pthread_t *threads;
+	struct open_vma_worker_arg *args;
+	long nproc;
+
+	if (nr_unique <= 0)
+		return 0;
+
+	nproc = sysconf(_SC_NPROCESSORS_ONLN);
+	if (nproc <= 0)
+		nproc = 1;
+	if (nproc > 32)
+		nproc = 32;
+	nworkers = (int)nproc;
+	if (nworkers > nr_unique)
+		nworkers = nr_unique;
+
+	threads = xmalloc(nworkers * sizeof(*threads));
+	args = xmalloc(nworkers * sizeof(*args));
+	if (!threads || !args) {
+		xfree(threads);
+		xfree(args);
+		return -1;
+	}
+
+	for (i = 0; i < nworkers; i++) {
+		args[i].unique = unique;
+		args[i].nr_unique = nr_unique;
+		args[i].worker_id = i;
+		args[i].nworkers = nworkers;
+		args[i].ret = 0;
+		if (pthread_create(&threads[i], NULL, open_vma_worker, &args[i]) != 0) {
+			ret = -1;
+			while (i--)
+				pthread_join(threads[i], NULL);
+			goto out;
+		}
+	}
+
+	for (i = 0; i < nworkers; i++) {
+		pthread_join(threads[i], NULL);
+		if (args[i].ret < 0)
+			ret = -1;
+	}
+out:
+	xfree(threads);
+	xfree(args);
+	return ret;
+}
+
 int open_vmas(struct pstree_item *t)
 {
 	int pid = vpid(t);
 	struct vma_area *vma;
 	struct vm_area_list *vmas = &rsti(t)->vmas;
+	struct open_vma_unique *unique = NULL;
+	int nr_unique = 0, cap_unique = 0;
+	struct vma_area **parallel_vmas = NULL;
+	int nr_parallel = 0, cap_parallel = 0;
+	struct {
+		int fd;
+		struct vma_area *vma;
+	} *last_per_fd = NULL;
+	int nr_last = 0, cap_last = 0;
+	int i, ret = -1;
 
 	filemap_ctx_init(false);
 
+	/* Phase 1: non-filemap VMAs (shmem, socket) + plugin; collect filemap + memfd for parallel open */
 	list_for_each_entry(vma, &vmas->h, list) {
 		if (!vma_area_is(vma, VMA_AREA_REGULAR) || !vma->vm_open)
 			continue;
@@ -1463,23 +1572,128 @@ int open_vmas(struct pstree_item *t)
 		pr_info("Opening %#016" PRIx64 "-%#016" PRIx64 " %#016" PRIx64 " (%x) vma\n", vma->e->start,
 			vma->e->end, vma->e->pgoff, vma->e->status);
 
-		if (vma->vm_open(pid, vma)) {
-			pr_err("`- Can't open vma\n");
-			return -1;
-		}
+		if (vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED)) {
+			bool is_plugin = !!(vma->e->status & VMA_EXT_PLUGIN);
+			bool is_memfd = !!(vma->e->status & VMA_AREA_MEMFD);
 
-		/*
-		 * File mappings have vm_open set to open_filemap which, in
-		 * turn, puts the VMA_CLOSE bit itself. For all the rest we
-		 * need to put it by hands, so that the restorer closes the fd
-		 */
-		if (!(vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED)))
-			vma->e->status |= VMA_CLOSE;
+			if (is_plugin) {
+				if (vma->vm_open(pid, vma)) {
+					pr_err("`- Can't open vma\n");
+					goto out;
+				}
+				continue;
+			}
+
+			/* Collect for parallel open: ensure unique (vmfd, flags) with rep_vma */
+			for (i = 0; i < nr_unique; i++)
+				if (unique[i].vmfd == vma->vmfd && unique[i].flags == vma->e->fdflags)
+					break;
+			if (i >= nr_unique) {
+				if (nr_unique >= cap_unique) {
+					int new_cap = cap_unique ? cap_unique * 2 : 64;
+					struct open_vma_unique *nu = xrealloc(unique,
+						new_cap * sizeof(*unique));
+					if (!nu)
+						goto out;
+					unique = nu;
+					cap_unique = new_cap;
+				}
+				unique[nr_unique].vmfd = vma->vmfd;
+				unique[nr_unique].flags = vma->e->fdflags;
+				unique[nr_unique].rep_vma = vma;
+				unique[nr_unique].fd = -1;
+				unique[nr_unique].is_memfd = is_memfd;
+				nr_unique++;
+			}
+
+			if (nr_parallel >= cap_parallel) {
+				int new_cap = cap_parallel ? cap_parallel * 2 : 128;
+				struct vma_area **np = xrealloc(parallel_vmas,
+					new_cap * sizeof(*parallel_vmas));
+				if (!np)
+					goto out;
+				parallel_vmas = np;
+				cap_parallel = new_cap;
+			}
+			parallel_vmas[nr_parallel++] = vma;
+		} else {
+			if (vma->vm_open(pid, vma)) {
+				pr_err("`- Can't open vma\n");
+				goto out;
+			}
+			if (!(vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED)))
+				vma->e->status |= VMA_CLOSE;
+		}
 	}
 
 	filemap_ctx_fini();
 
-	return 0;
+	/* Phase 2: parallel open for unique files */
+	if (nr_unique > 0) {
+		long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+		int nworkers = (int)(nproc <= 0 ? 1 : (nproc > 32 ? 32 : nproc));
+		if (nworkers > nr_unique)
+			nworkers = nr_unique;
+		pr_info("open_vmas: %d unique files, %d file-backed VMAs, %d workers\n",
+			nr_unique, nr_parallel, nworkers);
+	}
+	if (open_vmas_parallel_open(unique, nr_unique) < 0) {
+		pr_err("Parallel open failed\n");
+		goto out;
+	}
+
+	/* Phase 3: assign fds to parallel VMAs */
+	for (i = 0; i < nr_parallel; i++) {
+		int j, fd;
+
+		vma = parallel_vmas[i];
+		for (j = 0; j < nr_unique; j++)
+			if (unique[j].vmfd == vma->vmfd && unique[j].flags == vma->e->fdflags)
+				break;
+		if (j >= nr_unique)
+			goto out;
+		fd = unique[j].fd;
+		vma->e->fd = fd;
+	}
+
+	/* Phase 4: in list order, track last VMA per fd; then set VMA_CLOSE on each */
+	list_for_each_entry(vma, &vmas->h, list) {
+		int fd, j;
+
+		if (!vma_area_is(vma, VMA_AREA_REGULAR) || !vma->vm_open)
+			continue;
+		if (!(vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED)))
+			continue;
+		fd = vma->e->fd;
+		for (j = 0; j < nr_last; j++)
+			if (last_per_fd[j].fd == fd)
+				break;
+		if (j < nr_last)
+			last_per_fd[j].vma = vma;
+		else {
+			if (nr_last >= cap_last) {
+				int new_cap = cap_last ? cap_last * 2 : 64;
+				void *np = xrealloc(last_per_fd, new_cap * sizeof(*last_per_fd));
+				if (!np)
+					goto out;
+				last_per_fd = np;
+				cap_last = new_cap;
+			}
+			last_per_fd[nr_last].fd = fd;
+			last_per_fd[nr_last].vma = vma;
+			nr_last++;
+		}
+	}
+
+	for (i = 0; i < nr_last; i++)
+		last_per_fd[i].vma->e->status |= VMA_CLOSE;
+
+	ret = 0;
+out:
+	xfree(unique);
+	xfree(parallel_vmas);
+	xfree(last_per_fd);
+	return ret;
 }
 
 static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
@@ -1509,6 +1723,16 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		return -1;
 
 	ta->vma_ios_fd = img_raw_fd(pages);
+	if (ta->vma_ios_fd >= 0) {
+		int fl = fcntl(ta->vma_ios_fd, F_GETFL);
+		if (fl >= 0) {
+			int ret = fcntl(ta->vma_ios_fd, F_SETFL, fl | O_DIRECT);
+			if (ret < 0)
+				pr_warn("Failed to set O_DIRECT on pages fd: %s\n", strerror(errno));
+			else
+				pr_info("O_DIRECT enabled on pages fd %d\n", ta->vma_ios_fd);
+		}
+	}
 	return pagemap_render_iovec(&rsti(t)->vma_io, ta);
 }
 

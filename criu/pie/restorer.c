@@ -1571,38 +1571,47 @@ static int fd_poll(int inotify_fd)
 	return sys_ppoll(&pfd, 1, &tmo, NULL, sizeof(sigset_t));
 }
 
+#ifndef POSIX_FADV_WILLNEED
+#define POSIX_FADV_WILLNEED 3
+#endif
+#ifndef POSIX_FADV_SEQUENTIAL
+#define POSIX_FADV_SEQUENTIAL 2
+#endif
+
 /*
- * Call preadv() but limit size of the read. Zero `max_to_read` skips the limit.
+ * Advance restore_vma_io by 'res' bytes consumed. Updates rio in place.
+ * Returns the new (iov_ptr, nr_iovs) for resubmission, or 0 if fully done.
+ * Used when AIO returns a short read (kernel MAX_RW_COUNT = 0x7FFFF000 limit).
  */
-static ssize_t preadv_limited(int fd, struct iovec *iovs, int nr, off_t offs, size_t max_to_read)
+static void advance_vma_io_retry(struct restore_vma_io *rio, ssize_t res,
+				 struct iovec **iov_out, unsigned int *nr_out)
 {
-	size_t saved_last_iov_len = 0;
-	ssize_t ret;
+	size_t remaining = (size_t)res;
+	unsigned int j = 0;
 
-	if (max_to_read) {
-		for (int i = 0; i < nr; ++i) {
-			if (iovs[i].iov_len <= max_to_read) {
-				max_to_read -= iovs[i].iov_len;
-				continue;
-			}
+	rio->off += (off_t)res;
 
-			if (!max_to_read) {
-				nr = i;
-				break;
-			}
-
-			saved_last_iov_len = iovs[i].iov_len;
-			iovs[i].iov_len = max_to_read;
-			nr = i + 1;
+	while (j < (unsigned int)rio->nr_iovs && remaining > 0) {
+		size_t len = (size_t)rio->iovs[j].iov_len;
+		if (len <= remaining) {
+			remaining -= len;
+			rio->iovs[j].iov_len = 0;
+			j++;
+		} else {
+			rio->iovs[j].iov_base = (char *)rio->iovs[j].iov_base + remaining;
+			rio->iovs[j].iov_len = len - remaining;
+			remaining = 0;
 			break;
 		}
 	}
-
-	ret = sys_preadv(fd, iovs, nr, offs);
-	if (saved_last_iov_len)
-		iovs[nr - 1].iov_len = saved_last_iov_len;
-
-	return ret;
+	while (j < (unsigned int)rio->nr_iovs && rio->iovs[j].iov_len == 0)
+		j++;
+	*nr_out = 0;
+	for (unsigned int k = j; k < (unsigned int)rio->nr_iovs; k++) {
+		if (rio->iovs[k].iov_len > 0)
+			(*nr_out)++;
+	}
+	*iov_out = (j < (unsigned int)rio->nr_iovs) ? &rio->iovs[j] : NULL;
 }
 
 /*
@@ -1895,60 +1904,167 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	}
 
 	/*
-	 * Now read the contents (if any)
+	 * Now read the contents (if any).
+	 * Use Native AIO (io_submit + O_DIRECT) for high-throughput page reads.
+	 * Handles short reads (MAX_RW_COUNT 0x7FFFF000) by advancing and resubmitting.
 	 */
+	if (args->vma_ios_n > 0 && args->vma_ios_fd != -1) {
+		size_t vma_restore_len = 0;
+		struct timeval tv0, tv1;
+		unsigned int n = args->vma_ios_n;
+		int fd = args->vma_ios_fd;
+		aio_context_t aio_ctx = 0;
+		long aio_ret;
+		struct iocb *iocbs;
+		struct iocb **iocbps;
+		struct restore_vma_io **rio_ptrs;
+		struct io_event *events;
+		unsigned long alloc_sz;
+		unsigned int submitted = 0, completed = 0;
 
-	rio = args->vma_ios;
-	for (i = 0; i < args->vma_ios_n; i++) {
-		struct iovec *iovs = rio->iovs;
-		int nr = rio->nr_iovs;
-		ssize_t r;
+#define AIO_BATCH 128
 
-		while (nr) {
-			pr_debug("Preadv %lx:%d... (%d iovs)\n", (unsigned long)iovs->iov_base, (int)iovs->iov_len, nr);
-			/*
-			 * If we're requested to punch holes in the file after reading we do
-			 * it to save memory. Limit the reads then to an arbitrary block size.
-			 */
-			r = preadv_limited(args->vma_ios_fd, iovs, nr, rio->off,
-					   args->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
-			if (r < 0) {
-				pr_err("Can't read pages data (%d)\n", (int)r);
-				goto core_restore_end;
+		sys_gettimeofday(&tv0, NULL);
+
+		/* Compute total range for logging */
+		{
+			struct restore_vma_io *r = args->vma_ios;
+			unsigned int k;
+			off_t first_off = r->off, last_end = r->off;
+
+			for (k = 0; k < n; k++) {
+				size_t rio_len = 0;
+				for (int j = 0; j < r->nr_iovs; j++)
+					rio_len += (size_t)r->iovs[j].iov_len;
+				if (r->off < first_off)
+					first_off = r->off;
+				if ((off_t)(r->off + (off_t)rio_len) > last_end)
+					last_end = (off_t)(r->off + (off_t)rio_len);
+				r = (struct restore_vma_io *)((void *)r + RIO_SIZE(r->nr_iovs));
 			}
-
-			pr_debug("`- returned %ld\n", (long)r);
-			/* If the file is open for writing, then it means we should punch holes
-			 * in it. */
-			if (r > 0 && args->auto_dedup) {
-				int fr = sys_fallocate(args->vma_ios_fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
-						       rio->off, r);
-				if (fr < 0) {
-					pr_debug("Failed to punch holes with fallocate: %d\n", fr);
-				}
-			}
-			rio->off += r;
-			/* Advance the iovecs */
-			do {
-				if (iovs->iov_len <= r) {
-					pr_debug("   `- skip pagemap\n");
-					r -= iovs->iov_len;
-					iovs++;
-					nr--;
-					continue;
-				}
-
-				iovs->iov_base += r;
-				iovs->iov_len -= r;
-				break;
-			} while (nr > 0);
+			vma_restore_len = (size_t)(last_end - first_off);
 		}
 
-		rio = ((void *)rio) + RIO_SIZE(rio->nr_iovs);
-	}
+		aio_ret = sys_io_setup(AIO_BATCH, &aio_ctx);
+		if (aio_ret < 0) {
+			pr_err("io_setup(%d) failed: %ld\n", AIO_BATCH, aio_ret);
+			goto core_restore_end;
+		}
 
-	if (args->vma_ios_fd != -1)
-		sys_close(args->vma_ios_fd);
+		alloc_sz = n * sizeof(struct iocb)
+			 + n * sizeof(struct iocb *)
+			 + n * sizeof(struct restore_vma_io *)
+			 + AIO_BATCH * sizeof(struct io_event);
+		iocbs = (void *)sys_mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE,
+					 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (IS_ERR(iocbs)) {
+			pr_err("Can't mmap AIO buffers: %ld\n", PTR_ERR(iocbs));
+			goto core_restore_end;
+		}
+		iocbps = (struct iocb **)((void *)iocbs + n * sizeof(struct iocb));
+		rio_ptrs = (struct restore_vma_io **)((void *)iocbps + n * sizeof(struct iocb *));
+		events = (struct io_event *)((void *)rio_ptrs + n * sizeof(struct restore_vma_io *));
+
+		/* Build all iocbs from vma_ios */
+		rio = args->vma_ios;
+		for (i = 0; i < (int)n; i++) {
+			struct iocb *cb = &iocbs[i];
+			size_t expected = 0;
+
+			for (int j = 0; j < rio->nr_iovs; j++)
+				expected += rio->iovs[j].iov_len;
+
+			memset(cb, 0, sizeof(*cb));
+			cb->aio_fildes = fd;
+			cb->aio_lio_opcode = IOCB_CMD_PREADV;
+			cb->aio_buf = (unsigned long)rio->iovs;
+			cb->aio_nbytes = rio->nr_iovs;
+			cb->aio_offset = rio->off;
+			cb->aio_data = expected;
+			iocbps[i] = cb;
+			rio_ptrs[i] = rio;
+
+			rio = (void *)rio + RIO_SIZE(rio->nr_iovs);
+		}
+
+		/* Submit and reap in batches */
+		while (submitted < n || completed < n) {
+			while (submitted < n && (submitted - completed) < AIO_BATCH) {
+				unsigned int batch = n - submitted;
+				if (batch > AIO_BATCH - (submitted - completed))
+					batch = AIO_BATCH - (submitted - completed);
+				aio_ret = sys_io_submit(aio_ctx, batch, &iocbps[submitted]);
+				if (aio_ret <= 0) {
+					pr_err("io_submit failed: %ld (submitted %u/%u)\n",
+					       aio_ret, submitted, n);
+					goto core_restore_end;
+				}
+				submitted += aio_ret;
+			}
+
+			if (completed < n) {
+				/* min_nr=1 to block until at least one event; nr=AIO_BATCH to reap all (incl. retries) */
+				aio_ret = sys_io_getevents(aio_ctx, 1, AIO_BATCH, events, NULL);
+				if (aio_ret <= 0) {
+					pr_err("io_getevents failed: %ld\n", aio_ret);
+					goto core_restore_end;
+				}
+				for (long k = 0; k < aio_ret; k++) {
+					if (events[k].res < 0) {
+						pr_err("AIO read failed: %lld\n",
+						       events[k].res);
+						goto core_restore_end;
+					}
+					if ((__u64)events[k].res == events[k].data) {
+						completed++;
+						continue;
+					}
+					/* Short read (e.g. MAX_RW_COUNT 0x7FFFF000): advance and retry */
+					if (events[k].res == 0) {
+						pr_err("AIO zero read (expected %llu)\n",
+						       events[k].data);
+						goto core_restore_end;
+					}
+					{
+						struct iocb *cb = (struct iocb *)(unsigned long)events[k].obj;
+						unsigned int idx = cb - iocbs;
+						struct restore_vma_io *r = rio_ptrs[idx];
+						struct iovec *iov_next;
+						unsigned int nr_next;
+
+						advance_vma_io_retry(r, events[k].res,
+								   &iov_next, &nr_next);
+						if (!iov_next || nr_next == 0) {
+							completed++;
+							continue;
+						}
+						cb->aio_buf = (unsigned long)iov_next;
+						cb->aio_nbytes = nr_next;
+						cb->aio_offset = r->off;
+						cb->aio_data -= (__u64)events[k].res;
+						{
+							long ret2 = sys_io_submit(aio_ctx, 1, &cb);
+							if (ret2 != 1) {
+								pr_err("AIO retry submit failed: %ld\n",
+								       ret2);
+								goto core_restore_end;
+							}
+						}
+					}
+				}
+			}
+		}
+
+		sys_io_destroy(aio_ctx);
+		sys_munmap(iocbs, alloc_sz);
+		sys_gettimeofday(&tv1, NULL);
+		pr_info("VMA restore AIO %lu ms (range %zu MiB, %u ios)\n",
+			(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000),
+			vma_restore_len / (1024 * 1024), n);
+		sys_close(fd);
+		args->vma_ios_fd = -1;
+#undef AIO_BATCH
+	}
 
 	/*
 	 * Proxify vDSO.

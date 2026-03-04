@@ -364,8 +364,17 @@ static int mkreg_ghost(char *path, GhostFileEntry *gfe, struct cr_img *img)
 	int gfd, ret;
 
 	gfd = open(path, O_WRONLY | O_CREAT | O_EXCL, gfe->mode);
-	if (gfd < 0)
+	if (gfd < 0) {
+		/*
+		 * EEXIST: another concurrent restore process (rst_sibling) already
+		 * created this ghost file for the same shared deleted inode. Both
+		 * processes read identical checkpoint data so the file content is
+		 * correct; treat this as success and reuse the existing ghost.
+		 */
+		if (errno == EEXIST)
+			return 0;
 		return -1;
+	}
 
 	if (gfe->chunks) {
 		if (!gfe->has_size) {

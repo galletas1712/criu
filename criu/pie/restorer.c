@@ -1775,6 +1775,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	std_log_set_start(&args->logstart);
 
 	pr_info("Switched to the restorer %d\n", my_pid);
+	pr_info("T5: jump to restorer\n");
 
 	if (args->uffd > -1) {
 		pr_debug("lazy-pages: uffd %d\n", args->uffd);
@@ -1875,6 +1876,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	/*
 	 * OK, lets try to map new one.
 	 */
+	pr_info("T51: recreate VMAs and restore pages\n");
 	for (i = 0; i < args->vmas_n; i++) {
 		vma_entry = args->vmas + i;
 
@@ -2221,8 +2223,10 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	if (restore_membarrier_registrations(args->membarrier_registration_mask) < 0)
 		goto core_restore_end;
 
+	pr_info("T6: return from restorer\n");
 	pr_info("%ld: Restored\n", sys_getpid());
 
+	pr_info("T7: task reached restore barrier\n");
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE);
 
 	if (wait_helpers(args) < 0)

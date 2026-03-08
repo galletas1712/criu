@@ -316,6 +316,7 @@ static int root_prepare_shared(void)
 	struct pstree_item *pi;
 
 	pr_info("Preparing info about shared resources\n");
+	pr_info("R3: root_prepare_shared\n");
 
 	if (prepare_remaps())
 		return -1;
@@ -329,6 +330,7 @@ static int root_prepare_shared(void)
 	if (!files_collected() && collect_images(cinfos_files, ARRAY_SIZE(cinfos_files)))
 		return -1;
 
+	pr_info("R31: scan pstree mm/fd/fs images\n");
 	for_each_pstree_item(pi) {
 		if (pi->pid->state == TASK_HELPER)
 			continue;
@@ -349,6 +351,7 @@ static int root_prepare_shared(void)
 	if (ret < 0)
 		goto err;
 
+	pr_info("R33: pre-restore anon-private pages for COW\n");
 	prepare_cow_vmas();
 
 	ret = prepare_restorer_blob();
@@ -629,6 +632,7 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 {
 	unsigned args_len;
 	struct task_restore_args *ta;
+	pr_info("T1: prepare mappings\n");
 	pr_info("Restoring resources\n");
 
 	rst_mem_switch_to_private();
@@ -640,12 +644,14 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	memzero(ta, args_len);
 
+	pr_info("T2: prepare fds and locks\n");
 	if (prepare_fds(current))
 		return -1;
 
 	if (prepare_file_locks(pid))
 		return -1;
 
+	pr_info("T3: open VMAs\n");
 	if (open_vmas(current))
 		return -1;
 
@@ -655,6 +661,7 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	if (fixup_sysv_shmems())
 		return -1;
 
+	pr_info("T4: open core state\n");
 	if (open_cores(pid, core))
 		return -1;
 
@@ -1613,6 +1620,7 @@ static int __restore_task_with_children(void *_arg)
 		 */
 		if (mount_proc())
 			goto err;
+		pr_info("R1: join namespaces and mount proc\n");
 
 		if (!files_collected() && collect_image(&tty_cinfo))
 			goto err;
@@ -1622,6 +1630,7 @@ static int __restore_task_with_children(void *_arg)
 		if (prepare_namespace(current, ca->clone_flags))
 			goto err;
 
+		pr_info("R2: prepare namespaces\n");
 		if (restore_finish_ns_stage(CR_STATE_PREPARE_NAMESPACES, CR_STATE_FORKING) < 0)
 			goto err;
 
@@ -1652,6 +1661,7 @@ static int __restore_task_with_children(void *_arg)
 	if (open_transport_socket())
 		goto err;
 
+	pr_info("R4: fork process tree\n");
 	timing_start(TIME_FORK);
 
 	if (create_children_and_session())
@@ -1861,6 +1871,7 @@ static void finalize_restore(void)
 {
 	struct pstree_item *item;
 
+	pr_info("M11: attach/trap tasks at rt_sigreturn\n");
 	for_each_pstree_item(item) {
 		pid_t pid = item->pid->real;
 		struct parasite_ctl *ctl;
@@ -1895,6 +1906,7 @@ static int finalize_restore_detach(void)
 {
 	struct pstree_item *item;
 
+	pr_info("T9: before detach (rt_sigreturn into app)\n");
 	for_each_pstree_item(item) {
 		pid_t pid;
 		int i;
@@ -2001,6 +2013,7 @@ static int restore_root_task(struct pstree_item *init)
 	int root_seized = 0;
 	struct pstree_item *item;
 
+	pr_info("M4: pre-restore hooks\n");
 	ret = run_scripts(ACT_PRE_RESTORE);
 	if (ret != 0) {
 		pr_err("Aborting restore due to pre-restore script ret code %d\n", ret);
@@ -2027,6 +2040,7 @@ static int restore_root_task(struct pstree_item *init)
 	if (prepare_userns_hook())
 		return -1;
 
+	pr_info("M5: prepare namespaces before tasks\n");
 	if (prepare_namespace_before_tasks())
 		return -1;
 
@@ -2054,6 +2068,7 @@ static int restore_root_task(struct pstree_item *init)
 
 	__restore_switch_stage_nw(CR_STATE_ROOT_TASK);
 
+	pr_info("M6: fork root task\n");
 	ret = fork_with_pid(init);
 	if (ret < 0)
 		goto out;
@@ -2098,6 +2113,7 @@ static int restore_root_task(struct pstree_item *init)
 	if (ret)
 		goto out_kill;
 
+	pr_info("M7: setup-namespaces and post-setup-namespaces hooks\n");
 	ret = run_scripts(ACT_SETUP_NS);
 	if (ret)
 		goto out_kill;
@@ -2132,14 +2148,17 @@ static int restore_root_task(struct pstree_item *init)
 	__restore_switch_stage(CR_STATE_FORKING);
 
 skip_ns_bouncing:
+	pr_info("M8: post-forking plugins\n");
 	ret = run_plugins(POST_FORKING);
 	if (ret < 0 && ret != -ENOTSUP)
 		goto out_kill;
 
+	pr_info("M9: restore stage barrier (wait for tasks)\n");
 	ret = restore_wait_inprogress_tasks();
 	if (ret < 0)
 		goto out_kill;
 
+	pr_info("M10: apply memfd seals\n");
 	ret = apply_memfd_seals();
 	if (ret < 0)
 		goto out_kill;
@@ -2233,6 +2252,7 @@ skip_ns_bouncing:
 		pr_err("Can't stop all tasks on rt_sigreturn\n");
 		goto out_kill_network_unlocked;
 	}
+	pr_info("T8: tasks stopped at rt_sigreturn\n");
 
 	finalize_restore();
 
@@ -2249,6 +2269,7 @@ skip_ns_bouncing:
 	 * mapped memory) could be done sanely once the pie code hands
 	 * over the control to master process.
 	 */
+	pr_info("M12: RESUME_DEVICES_LATE\n");
 	pr_info("Run late stage hook from criu master for external devices\n");
 	for_each_pstree_item(item) {
 		if (!task_alive(item))
@@ -2266,6 +2287,7 @@ skip_ns_bouncing:
 			pr_debug("restore late stage hook for external plugin failed\n");
 	}
 
+	pr_info("M13: pre-resume hooks\n");
 	ret = run_scripts(ACT_PRE_RESUME);
 	if (ret)
 		pr_err("Pre-resume script ret code %d\n", ret);
@@ -2273,16 +2295,19 @@ skip_ns_bouncing:
 	if (restore_freezer_state())
 		pr_err("Unable to restore freezer state\n");
 
+	pr_info("M14: detach and tasks resume\n");
 	/* Detaches from processes and they continue run through sigreturn. */
 	if (finalize_restore_detach())
 		goto out_kill_network_unlocked;
 
 	pr_info("Restore finished successfully. Tasks resumed.\n");
+	pr_info("M16: restore finished\n");
 	write_stats(RESTORE_STATS);
 
 	/* This has the effect of dismissing the image streamer */
 	close_image_dir();
 
+	pr_info("M15: post-resume hooks\n");
 	ret = run_scripts(ACT_POST_RESUME);
 	if (ret != 0)
 		pr_err("Post-resume script ret code %d\n", ret);
@@ -2362,11 +2387,13 @@ int cr_restore_tasks(void)
 {
 	int ret = -1;
 
+	pr_info("M0: restore start\n");
 	if (init_service_fd())
 		return 1;
 
 	if (check_img_inventory(/* restore = */ true) < 0)
 		return -1;
+	pr_info("M1: inventory read\n");
 
 	if (init_stats(RESTORE_STATS))
 		return -1;
@@ -2395,6 +2422,7 @@ int cr_restore_tasks(void)
 
 	if (prepare_pstree() < 0)
 		return -1;
+	pr_info("M3: prepare pstree and task entries\n");
 
 	if (fdstore_init())
 		return -1;
@@ -2422,6 +2450,7 @@ int cr_restore_tasks(void)
 
 	if (prepare_lazy_pages_socket() < 0)
 		goto clean_cgroup;
+	pr_info("M2: early init done\n");
 
 	ret = restore_root_task(root_item);
 clean_cgroup:

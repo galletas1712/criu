@@ -1500,6 +1500,7 @@ int open_vmas(struct pstree_item *t)
 	int i, ret = -1;
 
 	filemap_ctx_init(false);
+	shmem_restore_timing_reset();
 
 	/* Phase 1: non-filemap VMAs (shmem, socket) + plugin; collect filemap + memfd for parallel open */
 	list_for_each_entry(vma, &vmas->h, list) {
@@ -1625,6 +1626,7 @@ out:
 	xfree(unique);
 	xfree(parallel_vmas);
 	xfree(last_per_fd);
+	shmem_restore_timing_dump(pid);
 	return ret;
 }
 

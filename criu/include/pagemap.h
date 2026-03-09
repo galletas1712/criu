@@ -102,6 +102,8 @@ struct page_read {
  */
 extern int open_page_read(unsigned long id, struct page_read *, int pr_flags);
 extern int open_page_read_at(int dfd, unsigned long id, struct page_read *pr, int pr_flags);
+extern int page_read_pages_fd(struct page_read *pr);
+extern off_t page_read_pages_off(struct page_read *pr);
 
 struct task_restore_args;
 

@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <limits.h>
 
 #include "common/config.h"
 #include "common/list.h"
@@ -17,6 +20,7 @@
 #include "rst-malloc.h"
 #include "vma.h"
 #include "mem.h"
+#include "pagemap.h"
 #include <compel/plugins/std/syscall-codes.h>
 #include "bitops.h"
 #include "log.h"
@@ -27,6 +31,89 @@
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
 #include "namespaces.h"
+
+#define SHMEM_COPY_WORKERS_MAX	      8
+#define SHMEM_COPY_WORKERS_MIN_BYTES (512UL * 1024 * 1024)
+
+struct shmem_restore_timing {
+	unsigned long open_ms;
+	unsigned long setup_ms;
+	unsigned long copy_ms;
+	unsigned long sync_ms;
+	unsigned long wait_ms;
+	unsigned long copied_bytes;
+	unsigned int events;
+	unsigned int async_runs;
+	unsigned int kernel_runs;
+	unsigned int worker_runs;
+};
+
+static struct shmem_restore_timing shmem_restore_timing;
+
+struct shmem_engine_timing {
+	unsigned long setup_ms;
+	unsigned long copy_ms;
+	unsigned long sync_ms;
+	unsigned long copied_bytes;
+	bool used_async;
+	bool used_kernel;
+	bool used_workers;
+};
+
+struct shmem_copy_extent {
+	off_t src_off;
+	off_t dst_off;
+	size_t len;
+};
+
+static unsigned long shmem_tvdiff_ms(const struct timeval *from, const struct timeval *to)
+{
+	time_t sec = to->tv_sec - from->tv_sec;
+	suseconds_t usec = to->tv_usec - from->tv_usec;
+
+	if (usec < 0) {
+		sec--;
+		usec += 1000000;
+	}
+
+	return sec * 1000 + usec / 1000;
+}
+
+static void shmem_timing_add(unsigned long *dst, const struct timeval *from, const struct timeval *to)
+{
+	*dst += shmem_tvdiff_ms(from, to);
+}
+
+void shmem_restore_timing_reset(void)
+{
+	memzero(&shmem_restore_timing, sizeof(shmem_restore_timing));
+}
+
+void shmem_restore_timing_dump(int pid)
+{
+	if (!shmem_restore_timing.events)
+		return;
+
+	pr_info("open_vmas shmem pid %d: open %lu ms setup %lu ms copy %lu ms sync %lu ms wait %lu ms, copied %lu MiB, events %u (async %u kernel %u workers %u)\n",
+		pid, shmem_restore_timing.open_ms, shmem_restore_timing.setup_ms, shmem_restore_timing.copy_ms,
+		shmem_restore_timing.sync_ms, shmem_restore_timing.wait_ms,
+		shmem_restore_timing.copied_bytes / (1024 * 1024), shmem_restore_timing.events,
+		shmem_restore_timing.async_runs, shmem_restore_timing.kernel_runs, shmem_restore_timing.worker_runs);
+}
+
+static void shmem_timing_accumulate(const struct shmem_engine_timing *tim)
+{
+	if (!tim)
+		return;
+
+	shmem_restore_timing.setup_ms += tim->setup_ms;
+	shmem_restore_timing.copy_ms += tim->copy_ms;
+	shmem_restore_timing.sync_ms += tim->sync_ms;
+	shmem_restore_timing.copied_bytes += tim->copied_bytes;
+	shmem_restore_timing.async_runs += tim->used_async;
+	shmem_restore_timing.kernel_runs += tim->used_kernel;
+	shmem_restore_timing.worker_runs += tim->used_workers;
+}
 
 #ifndef SEEK_DATA
 #define SEEK_DATA 3
@@ -448,19 +535,28 @@ int collect_shmem(int pid, struct vma_area *vma)
 	return 0;
 }
 
-static int shmem_wait_and_open(struct shmem_info *si, VmaEntry *vi)
+static int shmem_wait_and_open(struct shmem_info *si, VmaEntry *vi, unsigned long *wait_ms, unsigned long *open_ms)
 {
 	char path[128];
 	int ret;
+	struct timeval tv0, tv1;
 
 	pr_info("Waiting for the %lx shmem to appear\n", si->shmid);
+	gettimeofday(&tv0, NULL);
 	futex_wait_while(&si->lock, 0);
+	gettimeofday(&tv1, NULL);
+	if (wait_ms)
+		*wait_ms += shmem_tvdiff_ms(&tv0, &tv1);
 
 	snprintf(path, sizeof(path), "/proc/%d/fd/%d", si->pid, si->fd);
 
 	pr_info("Opening shmem [%s] \n", path);
+	gettimeofday(&tv0, NULL);
 	ret = open_proc_rw(si->pid, "fd/%d", si->fd);
+	gettimeofday(&tv1, NULL);
 	futex_inc_and_wake(&si->lock);
+	if (open_ms)
+		*open_ms += shmem_tvdiff_ms(&tv0, &tv1);
 	if (ret < 0)
 		return -1;
 
@@ -468,79 +564,372 @@ static int shmem_wait_and_open(struct shmem_info *si, VmaEntry *vi)
 	return 0;
 }
 
-static int do_restore_shmem_content(void *addr, unsigned long size, unsigned long shmid)
+static int shmem_extent_append(struct shmem_copy_extent **extents, unsigned int *nr, unsigned int *cap, off_t src_off,
+			       off_t dst_off, size_t len)
+{
+	struct shmem_copy_extent *new_extents;
+
+	if (!len)
+		return 0;
+
+	if (*nr >= *cap) {
+		unsigned int new_cap = *cap ? *cap * 2 : 256;
+
+		new_extents = xrealloc(*extents, new_cap * sizeof(**extents));
+		if (!new_extents)
+			return -1;
+		*extents = new_extents;
+		*cap = new_cap;
+	}
+
+	(*extents)[*nr].src_off = src_off;
+	(*extents)[*nr].dst_off = dst_off;
+	(*extents)[*nr].len = len;
+	(*nr)++;
+	return 0;
+}
+
+static int shmem_collect_copy_extents(struct page_read *pr, unsigned long size, struct shmem_copy_extent **extents,
+				      unsigned int *nr_extents, unsigned long *total_bytes)
+{
+	off_t src_off = 0;
+	unsigned int i, nr = 0, cap = 0;
+	struct shmem_copy_extent *list = NULL;
+
+	for (i = 0; i < pr->nr_pmes; i++) {
+		PagemapEntry *pe = pr->pmes[i];
+		unsigned long vaddr = (unsigned long)decode_pointer(pe->vaddr);
+		size_t len = (size_t)pe->nr_pages * PAGE_SIZE;
+
+		if (vaddr + len > size) {
+			pr_err("Shmem pagemap entry out of bounds: %lx + %zu > %lx\n", vaddr, len, size);
+			goto err;
+		}
+
+		if (pagemap_in_parent(pe))
+			goto unsupported;
+
+		if (!pagemap_present(pe))
+			continue;
+
+		if (shmem_extent_append(&list, &nr, &cap, src_off, (off_t)vaddr, len))
+			goto err;
+
+		src_off += len;
+		*total_bytes += len;
+	}
+
+	*extents = list;
+	*nr_extents = nr;
+	return 0;
+
+unsupported:
+	xfree(list);
+	return 1;
+err:
+	xfree(list);
+	return -1;
+}
+
+static int shmem_copy_extent(int src_fd, off_t src_off, int dst_fd, off_t dst_off, size_t len)
+{
+	while (len) {
+		size_t chunk = min_t(size_t, len, SSIZE_MAX);
+		ssize_t n = copy_file_range(src_fd, &src_off, dst_fd, &dst_off, chunk, 0);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+
+		if (!n) {
+			errno = EIO;
+			return -1;
+		}
+
+		len -= n;
+	}
+
+	return 0;
+}
+
+static int shmem_copy_worker(int worker_id, int nr_workers, int src_fd, int dst_fd, struct shmem_copy_extent *extents,
+			     unsigned int nr_extents)
+{
+	unsigned int i;
+
+	for (i = worker_id; i < nr_extents; i += nr_workers) {
+		if (!extents[i].len)
+			continue;
+		if (shmem_copy_extent(src_fd, extents[i].src_off, dst_fd, extents[i].dst_off, extents[i].len)) {
+			pr_perror("copy_file_range failed for extent %u", i);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int shmem_copy_extents_parallel(int nr_workers, int src_fd, int dst_fd, struct shmem_copy_extent *extents,
+				       unsigned int nr_extents)
+{
+	pid_t pids[SHMEM_COPY_WORKERS_MAX];
+	int started = 0, i;
+
+	BUG_ON(nr_workers <= 1 || nr_workers > SHMEM_COPY_WORKERS_MAX);
+
+	for (i = 0; i < nr_workers; i++) {
+		pid_t pid = fork();
+
+		if (pid < 0) {
+			pr_perror("Failed to fork shmem copy worker");
+			goto wait_children;
+		}
+
+		if (pid == 0) {
+			int rc = shmem_copy_worker(i, nr_workers, src_fd, dst_fd, extents, nr_extents);
+			_exit(rc ? 1 : 0);
+		}
+
+		pids[started++] = pid;
+	}
+
+wait_children:
+	for (i = 0; i < started; i++) {
+		int status;
+
+		if (waitpid(pids[i], &status, 0) < 0) {
+			pr_perror("waitpid failed for shmem copy worker");
+			return -1;
+		}
+
+		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+			pr_err("Shmem copy worker %d failed\n", pids[i]);
+			return -1;
+		}
+	}
+
+	return started == nr_workers ? 0 : -1;
+}
+
+static int shmem_choose_workers(unsigned long total_bytes, unsigned int nr_extents)
+{
+	long cpus;
+	int nr_workers;
+
+	if (total_bytes < SHMEM_COPY_WORKERS_MIN_BYTES || nr_extents < 2)
+		return 1;
+
+	cpus = sysconf(_SC_NPROCESSORS_ONLN);
+	if (cpus < 1)
+		cpus = 1;
+
+	nr_workers = min_t(int, cpus, SHMEM_COPY_WORKERS_MAX);
+	nr_workers = min_t(int, nr_workers, nr_extents);
+	if (nr_workers < 1)
+		nr_workers = 1;
+	return nr_workers;
+}
+
+static int shmem_restore_async(struct page_read *pr, void *addr, unsigned long size, struct shmem_engine_timing *tim)
 {
 	int ret = 0;
-	struct page_read pr;
+	struct timeval tv0, tv1;
 
-	ret = open_page_read(shmid, &pr, PR_SHMEM);
-	if (ret <= 0)
-		return -1;
-
+	gettimeofday(&tv0, NULL);
 	while (1) {
 		unsigned long vaddr;
 		unsigned nr_pages;
 
-		ret = pr.advance(&pr);
+		ret = pr->advance(pr);
 		if (ret <= 0)
 			break;
 
-		vaddr = (unsigned long)decode_pointer(pr.pe->vaddr);
-		nr_pages = pr.pe->nr_pages;
+		vaddr = (unsigned long)decode_pointer(pr->pe->vaddr);
+		nr_pages = pr->pe->nr_pages;
 
-		if (vaddr + nr_pages * PAGE_SIZE > size)
-			break;
+		if (vaddr + nr_pages * PAGE_SIZE > size) {
+			pr_err("Shmem read out of bounds: %lx + %lu > %lx\n", vaddr, nr_pages * PAGE_SIZE, size);
+			return -1;
+		}
 
-		pr.read_pages(&pr, vaddr, nr_pages, addr + vaddr, 0);
+		ret = pr->read_pages(pr, vaddr, nr_pages, addr + vaddr, PR_ASYNC);
+		if (ret < 0)
+			return -1;
+
+		if (tim)
+			tim->copied_bytes += (unsigned long)nr_pages * PAGE_SIZE;
+	}
+	gettimeofday(&tv1, NULL);
+	if (tim) {
+		shmem_timing_add(&tim->copy_ms, &tv0, &tv1);
+		tim->used_async = true;
 	}
 
+	if (ret < 0)
+		return -1;
+
+	gettimeofday(&tv0, NULL);
+	ret = pr->sync(pr);
+	gettimeofday(&tv1, NULL);
+	if (tim)
+		shmem_timing_add(&tim->sync_ms, &tv0, &tv1);
+	if (ret)
+		return -1;
+
+	return 0;
+}
+
+/*
+ * Returns:
+ * 0  - copied using copy_file_range path
+ * 1  - path not applicable (e.g. parent images or unsupported syscall)
+ * -1 - fatal error
+ */
+static int shmem_restore_kernel_copy(struct page_read *pr, int dst_fd, unsigned long size, struct shmem_engine_timing *tim)
+{
+	struct shmem_copy_extent *extents = NULL;
+	unsigned int nr_extents = 0;
+	unsigned long total_bytes = 0;
+	int nr_workers;
+	int src_fd, ret;
+	struct timeval tv0, tv1;
+
+	/*
+	 * Disabled for now: this path can fail with EXDEV (cross-device copy_file_range)
+	 * in some deployments. Keep async pagemap restore path as the stable default.
+	 */
+	return 1;
+
+	if (page_read_has_parent(pr))
+		return 1;
+
+	src_fd = page_read_pages_fd(pr);
+	if (src_fd < 0)
+		return 1;
+
+	ret = shmem_collect_copy_extents(pr, size, &extents, &nr_extents, &total_bytes);
+	if (ret)
+		return ret;
+
+	if (!nr_extents) {
+		xfree(extents);
+		return 0;
+	}
+
+	gettimeofday(&tv0, NULL);
+	nr_workers = shmem_choose_workers(total_bytes, nr_extents);
+	errno = 0;
+	if (nr_workers > 1)
+		ret = shmem_copy_extents_parallel(nr_workers, src_fd, dst_fd, extents, nr_extents);
+	else
+		ret = shmem_copy_worker(0, 1, src_fd, dst_fd, extents, nr_extents);
+	gettimeofday(&tv1, NULL);
+
+	if (ret && nr_workers == 1 && (errno == ENOSYS || errno == EOPNOTSUPP || errno == EXDEV || errno == EINVAL)) {
+		xfree(extents);
+		return 1;
+	}
+	if (ret) {
+		pr_perror("Failed to restore shmem 0x%lx with copy_file_range", pr->img_id);
+		xfree(extents);
+		return -1;
+	}
+
+	if (tim) {
+		shmem_timing_add(&tim->copy_ms, &tv0, &tv1);
+		tim->copied_bytes += total_bytes;
+		tim->used_kernel = true;
+		tim->used_workers = nr_workers > 1;
+	}
+
+	xfree(extents);
+	return 0;
+}
+
+static int do_restore_shmem_content_ex(void *addr, unsigned long size, unsigned long shmid, struct shmem_engine_timing *tim)
+{
+	int ret;
+	struct page_read pr;
+
+	ret = open_page_read(shmid, &pr, PR_SHMEM);
+	if (ret < 0)
+		return -1;
+	if (!ret)
+		return 0;
+
+	ret = shmem_restore_async(&pr, addr, size, tim);
 	pr.close(&pr);
+	return ret;
+}
+
+static int restore_memfd_shmem_content_ex(int fd, unsigned long shmid, unsigned long size, struct shmem_engine_timing *tim)
+{
+	void *addr = MAP_FAILED;
+	unsigned long aligned_size = round_up(size, PAGE_SIZE);
+	int ret = 0;
+	struct page_read pr;
+	struct timeval tv0, tv1;
+
+	if (!size)
+		return 0;
+
+	if (ftruncate(fd, size) < 0) {
+		pr_perror("Can't resize shmem 0x%lx size=%ld", shmid, size);
+		return -1;
+	}
+
+	ret = open_page_read(shmid, &pr, PR_SHMEM);
+	if (ret < 0)
+		return -1;
+	if (!ret)
+		return 0;
+
+	ret = shmem_restore_kernel_copy(&pr, fd, aligned_size, tim);
+	if (!ret) {
+		pr.close(&pr);
+		return 0;
+	}
+	if (ret < 0) {
+		pr.close(&pr);
+		return -1;
+	}
+
+	gettimeofday(&tv0, NULL);
+	addr = mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+	gettimeofday(&tv1, NULL);
+	if (tim)
+		shmem_timing_add(&tim->setup_ms, &tv0, &tv1);
+	if (addr == MAP_FAILED) {
+		pr_perror("Can't mmap shmem 0x%lx size=%ld", shmid, size);
+		pr.close(&pr);
+		return -1;
+	}
+
+	pr.reset(&pr);
+	ret = shmem_restore_async(&pr, addr, aligned_size, tim);
+	pr.close(&pr);
+
+	if (munmap(addr, size))
+		pr_perror("munmap failed for shmem 0x%lx", shmid);
+
 	return ret;
 }
 
 int restore_shmem_content(void *addr, struct shmem_info *si)
 {
-	return do_restore_shmem_content(addr, si->size, si->shmid);
+	return do_restore_shmem_content_ex(addr, si->size, si->shmid, NULL);
 }
 
 int restore_sysv_shmem_content(void *addr, unsigned long size, unsigned long shmid)
 {
-	return do_restore_shmem_content(addr, round_up(size, PAGE_SIZE), shmid);
+	return do_restore_shmem_content_ex(addr, round_up(size, PAGE_SIZE), shmid, NULL);
 }
 
 int restore_memfd_shmem_content(int fd, unsigned long shmid, unsigned long size)
 {
-	void *addr = NULL;
-	int ret = 1;
-
-	if (size == 0)
-		return 0;
-
-	if (ftruncate(fd, size) < 0) {
-		pr_perror("Can't resize shmem 0x%lx size=%ld", shmid, size);
-		goto out;
-	}
-
-	addr = mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
-	if (addr == MAP_FAILED) {
-		pr_perror("Can't mmap shmem 0x%lx size=%ld", shmid, size);
-		goto out;
-	}
-
-	/*
-	 * do_restore_shmem_content needs size to be page aligned.
-	 */
-	if (do_restore_shmem_content(addr, round_up(size, PAGE_SIZE), shmid) < 0) {
-		pr_err("Can't restore shmem content\n");
-		goto out;
-	}
-
-	ret = 0;
-
-out:
-	if (addr)
-		munmap(addr, size);
-	return ret;
+	return restore_memfd_shmem_content_ex(fd, shmid, size, NULL);
 }
 
 struct open_map_file_args {
@@ -558,9 +947,15 @@ static int open_shmem(int pid, struct vma_area *vma)
 {
 	VmaEntry *vi = vma->e;
 	struct shmem_info *si;
+	struct shmem_engine_timing engine_tim = { 0 };
 	void *addr = MAP_FAILED;
 	int f = -1;
 	int flags, is_hugetlb, memfd_flag = 0;
+	unsigned long open_ms = 0, setup_ms = 0, wait_ms = 0;
+	struct timeval tv0, tv1;
+	bool use_memfd = false;
+
+	shmem_restore_timing.events++;
 
 	si = shmem_find(vi->shmid);
 	pr_info("Search for %#016" PRIx64 " shmem 0x%" PRIx64 " %p/%d\n", vi->start, vi->shmid, si, si ? si->pid : -1);
@@ -571,11 +966,19 @@ static int open_shmem(int pid, struct vma_area *vma)
 
 	BUG_ON(si->pid == SYSVIPC_SHMEM_PID);
 
-	if (si->pid != pid)
-		return shmem_wait_and_open(si, vi);
+	if (si->pid != pid) {
+		int ret = shmem_wait_and_open(si, vi, &wait_ms, &open_ms);
+
+		shmem_restore_timing.open_ms += open_ms;
+		shmem_restore_timing.wait_ms += wait_ms;
+		return ret;
+	}
 
 	if (si->fd != -1) {
+		gettimeofday(&tv0, NULL);
 		f = dup(si->fd);
+		gettimeofday(&tv1, NULL);
+		open_ms += shmem_tvdiff_ms(&tv0, &tv1);
 		if (f < 0) {
 			pr_perror("Can't dup shmem fd");
 			return -1;
@@ -594,48 +997,73 @@ static int open_shmem(int pid, struct vma_area *vma)
 	}
 
 	if (kdat.has_memfd && (!is_hugetlb || kdat.has_memfd_hugetlb)) {
+		gettimeofday(&tv0, NULL);
 		f = memfd_create("", memfd_flag);
+		gettimeofday(&tv1, NULL);
+		open_ms += shmem_tvdiff_ms(&tv0, &tv1);
 		if (f < 0) {
 			pr_perror("Unable to create memfd");
 			goto err;
 		}
 
+		gettimeofday(&tv0, NULL);
 		if (ftruncate(f, si->size)) {
+			gettimeofday(&tv1, NULL);
+			open_ms += shmem_tvdiff_ms(&tv0, &tv1);
 			pr_perror("Unable to truncate memfd");
 			goto err;
 		}
+		gettimeofday(&tv1, NULL);
+		open_ms += shmem_tvdiff_ms(&tv0, &tv1);
 		flags |= MAP_FILE;
-	} else
+		use_memfd = true;
+	} else {
 		flags |= MAP_ANONYMOUS;
-
-	/*
-	 * The following hack solves problems:
-	 * vi->pgoff may be not zero in a target process.
-	 * This mapping may be mapped more then once.
-	 * The restorer doesn't have snprintf.
-	 * Here is a good place to restore content
-	 */
-	addr = mmap(NULL, si->size, PROT_WRITE | PROT_READ, flags, f, 0);
-	if (addr == MAP_FAILED) {
-		pr_perror("Can't mmap shmid=0x%" PRIx64 " size=%ld", vi->shmid, si->size);
-		goto err;
 	}
 
-	if (restore_shmem_content(addr, si) < 0) {
-		pr_err("Can't restore shmem content\n");
-		goto err;
-	}
-
-	if (f == -1) {
-		struct open_map_file_args args = {
-			.addr = (unsigned long)addr,
-			.size = si->size,
-		};
-		f = userns_call(open_map_file, UNS_FDOUT, &args, sizeof(args), -1);
-		if (f < 0)
+	if (use_memfd) {
+		if (restore_memfd_shmem_content_ex(f, vi->shmid, si->size, &engine_tim) < 0) {
+			pr_err("Can't restore memfd shmem content\n");
 			goto err;
+		}
+	} else {
+		/*
+		 * The following hack solves problems:
+		 * vi->pgoff may be not zero in a target process.
+		 * This mapping may be mapped more then once.
+		 * The restorer doesn't have snprintf.
+		 * Here is a good place to restore content
+		 */
+		gettimeofday(&tv0, NULL);
+		addr = mmap(NULL, si->size, PROT_WRITE | PROT_READ, flags, f, 0);
+		gettimeofday(&tv1, NULL);
+		setup_ms += shmem_tvdiff_ms(&tv0, &tv1);
+		if (addr == MAP_FAILED) {
+			pr_perror("Can't mmap shmid=0x%" PRIx64 " size=%ld", vi->shmid, si->size);
+			goto err;
+		}
+
+		if (do_restore_shmem_content_ex(addr, si->size, vi->shmid, &engine_tim) < 0) {
+			pr_err("Can't restore shmem content\n");
+			goto err;
+		}
+
+		if (f == -1) {
+			struct open_map_file_args args = {
+				.addr = (unsigned long)addr,
+				.size = si->size,
+			};
+
+			gettimeofday(&tv0, NULL);
+			f = userns_call(open_map_file, UNS_FDOUT, &args, sizeof(args), -1);
+			gettimeofday(&tv1, NULL);
+			setup_ms += shmem_tvdiff_ms(&tv0, &tv1);
+			if (f < 0)
+				goto err;
+		}
+		munmap(addr, si->size);
+		addr = MAP_FAILED;
 	}
-	munmap(addr, si->size);
 
 	si->fd = f;
 
@@ -645,14 +1073,25 @@ static int open_shmem(int pid, struct vma_area *vma)
 	 * All other regions in this process will duplicate
 	 * the file descriptor, so we don't wait them.
 	 */
+	gettimeofday(&tv0, NULL);
 	futex_wait_until(&si->lock, si->count - si->self_count + 1);
+	gettimeofday(&tv1, NULL);
+	wait_ms += shmem_tvdiff_ms(&tv0, &tv1);
 out:
 	vi->fd = f;
+	shmem_restore_timing.open_ms += open_ms;
+	shmem_restore_timing.setup_ms += setup_ms;
+	shmem_restore_timing.wait_ms += wait_ms;
+	shmem_timing_accumulate(&engine_tim);
 	return 0;
 err:
 	if (addr != MAP_FAILED)
 		munmap(addr, si->size);
 	close_safe(&f);
+	shmem_restore_timing.open_ms += open_ms;
+	shmem_restore_timing.setup_ms += setup_ms;
+	shmem_restore_timing.wait_ms += wait_ms;
+	shmem_timing_accumulate(&engine_tim);
 	return -1;
 }
 

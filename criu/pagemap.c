@@ -899,6 +899,22 @@ int open_page_read(unsigned long img_id, struct page_read *pr, int pr_flags)
 	return open_page_read_at(get_service_fd(IMG_FD_OFF), img_id, pr, pr_flags);
 }
 
+int page_read_pages_fd(struct page_read *pr)
+{
+	if (!pr || !pr->pi)
+		return -1;
+
+	return img_raw_fd(pr->pi);
+}
+
+off_t page_read_pages_off(struct page_read *pr)
+{
+	if (!pr)
+		return -1;
+
+	return pr->pi_off;
+}
+
 #define DUP_IDS_BASE 1000
 
 void page_read_disable_dedup(struct page_read *pr)

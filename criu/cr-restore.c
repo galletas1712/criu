@@ -639,6 +639,8 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	rst_mem_switch_to_private();
 
 	args_len = round_up(sizeof(*ta) + sizeof(struct thread_restore_args) * current->nr_threads, page_size());
+	pr_info("T1: task_restore_args %zu bytes, thread_restore_args %zu bytes, nr_threads %d, args_len %u\n",
+		sizeof(*ta), sizeof(struct thread_restore_args), current->nr_threads, args_len);
 	ta = mmap(NULL, args_len, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
 	if (!ta)
 		return -1;

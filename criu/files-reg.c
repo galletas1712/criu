@@ -2605,7 +2605,7 @@ static int open_filemap(int pid, struct vma_area *vma)
 
 /*
  * Open one file for a VMA (normal open_path path only).
- * Used by parallel open_vmas; does not touch filemap_ctx.
+ * Used by open_vmas; does not touch filemap_ctx.
  * Caller must ensure vma is not VMA_EXT_PLUGIN or VMA_AREA_MEMFD.
  */
 int open_file_for_vma(struct vma_area *vma, u32 flags)

@@ -2576,7 +2576,8 @@ int parse_threads(int pid, struct pid **_t, int *_n)
 		xfree(tids);
 		return -1;
 	}
-	if (n_tids > orig_n) {
+	/* When orig_n > 0 we are re-parsing (e.g. restore) and expect exact count. When orig_n == 0 we are discovering (e.g. dump) and accept any count. */
+	if (orig_n > 0 && n_tids > orig_n) {
 		pr_err("parse_threads: unexpected extra threads for pid %d "
 		       "(expected %d, got %d)\n",
 		       pid, orig_n, n_tids);

@@ -5,7 +5,6 @@
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
-#include <pthread.h>
 
 #include "types.h"
 #include "cr_options.h"
@@ -1451,7 +1450,7 @@ int unmap_guard_pages(struct pstree_item *t)
 }
 
 /*
- * One unique (vmfd, flags) for parallel open. fd is filled by workers.
+ * One unique (vmfd, flags) for opening. fd is filled by open_vmas_unique_open.
  */
 struct open_vma_unique {
 	struct file_desc *vmfd;
@@ -1461,23 +1460,15 @@ struct open_vma_unique {
 	bool is_memfd;
 };
 
-struct open_vma_worker_arg {
-	struct open_vma_unique *unique;
-	int nr_unique;
-	int worker_id;
-	int nworkers;
-	int ret;
-};
-
-static void *open_vma_worker(void *arg_)
+static int open_vmas_unique_open(struct open_vma_unique *unique, int nr_unique)
 {
-	struct open_vma_worker_arg *arg = arg_;
-	int i;
+	int i, fd;
 
-	arg->ret = 0;
-	for (i = arg->worker_id; i < arg->nr_unique; i += arg->nworkers) {
-		struct open_vma_unique *u = &arg->unique[i];
-		int fd;
+	if (nr_unique <= 0)
+		return 0;
+
+	for (i = 0; i < nr_unique; i++) {
+		struct open_vma_unique *u = &unique[i];
 
 		if (u->is_memfd) {
 			if (!inherited_fd(u->vmfd, &fd))
@@ -1485,65 +1476,11 @@ static void *open_vma_worker(void *arg_)
 		} else
 			fd = open_file_for_vma(u->rep_vma, u->flags);
 
-		if (fd < 0) {
-			arg->ret = -1;
-			return NULL;
-		}
+		if (fd < 0)
+			return -1;
 		u->fd = fd;
 	}
-	return NULL;
-}
-
-static int open_vmas_parallel_open(struct open_vma_unique *unique, int nr_unique)
-{
-	int i, nworkers, ret = 0;
-	pthread_t *threads;
-	struct open_vma_worker_arg *args;
-	long nproc;
-
-	if (nr_unique <= 0)
-		return 0;
-
-	nproc = sysconf(_SC_NPROCESSORS_ONLN);
-	if (nproc <= 0)
-		nproc = 1;
-	if (nproc > 32)
-		nproc = 32;
-	nworkers = (int)nproc;
-	if (nworkers > nr_unique)
-		nworkers = nr_unique;
-
-	threads = xmalloc(nworkers * sizeof(*threads));
-	args = xmalloc(nworkers * sizeof(*args));
-	if (!threads || !args) {
-		xfree(threads);
-		xfree(args);
-		return -1;
-	}
-
-	for (i = 0; i < nworkers; i++) {
-		args[i].unique = unique;
-		args[i].nr_unique = nr_unique;
-		args[i].worker_id = i;
-		args[i].nworkers = nworkers;
-		args[i].ret = 0;
-		if (pthread_create(&threads[i], NULL, open_vma_worker, &args[i]) != 0) {
-			ret = -1;
-			while (i--)
-				pthread_join(threads[i], NULL);
-			goto out;
-		}
-	}
-
-	for (i = 0; i < nworkers; i++) {
-		pthread_join(threads[i], NULL);
-		if (args[i].ret < 0)
-			ret = -1;
-	}
-out:
-	xfree(threads);
-	xfree(args);
-	return ret;
+	return 0;
 }
 
 int open_vmas(struct pstree_item *t)
@@ -1628,21 +1565,16 @@ int open_vmas(struct pstree_item *t)
 
 	filemap_ctx_fini();
 
-	/* Phase 2: parallel open for unique files */
-	if (nr_unique > 0) {
-		long nproc = sysconf(_SC_NPROCESSORS_ONLN);
-		int nworkers = (int)(nproc <= 0 ? 1 : (nproc > 32 ? 32 : nproc));
-		if (nworkers > nr_unique)
-			nworkers = nr_unique;
-		pr_info("open_vmas: %d unique files, %d file-backed VMAs, %d workers\n",
-			nr_unique, nr_parallel, nworkers);
-	}
-	if (open_vmas_parallel_open(unique, nr_unique) < 0) {
-		pr_err("Parallel open failed\n");
+	/* Phase 2: open unique files (AIO used for reads in restorer) */
+	if (nr_unique > 0)
+		pr_info("open_vmas: %d unique files, %d file-backed VMAs\n",
+			nr_unique, nr_parallel);
+	if (open_vmas_unique_open(unique, nr_unique) < 0) {
+		pr_err("Open VMAs failed\n");
 		goto out;
 	}
 
-	/* Phase 3: assign fds to parallel VMAs */
+	/* Phase 3: assign fds to VMAs */
 	for (i = 0; i < nr_parallel; i++) {
 		int j, fd;
 

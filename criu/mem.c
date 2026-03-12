@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <pthread.h>
 
 #include "types.h"
 #include "cr_options.h"
@@ -1460,6 +1461,189 @@ struct open_vma_unique {
 	bool is_memfd;
 };
 
+#define OPEN_VMAS_MEMFD_WORKERS_MAX 8
+
+struct memfd_open_plan {
+	struct open_vma_unique **jobs;
+	int nr_jobs;
+	int next_job;
+	int stop;
+	int ret;
+	pthread_mutex_t lock;
+};
+
+static int memfd_open_jobs_collect(struct open_vma_unique *unique, int nr_unique, struct open_vma_unique ***jobs_out)
+{
+	struct open_vma_unique **jobs = NULL;
+	int nr_jobs = 0, cap_jobs = 0;
+	int i, j;
+
+	for (i = 0; i < nr_unique; i++) {
+		void *inode_key;
+
+		if (!unique[i].is_memfd)
+			continue;
+		if (inherited_fd(unique[i].vmfd, NULL))
+			continue;
+
+		inode_key = memfd_inode_cookie(unique[i].vmfd);
+		for (j = 0; j < nr_jobs; j++) {
+			if (memfd_inode_cookie(jobs[j]->vmfd) == inode_key)
+				break;
+		}
+		if (j < nr_jobs)
+			continue;
+
+		if (nr_jobs >= cap_jobs) {
+			int new_cap = cap_jobs ? cap_jobs * 2 : 32;
+			struct open_vma_unique **new_jobs;
+
+			new_jobs = xrealloc(jobs, new_cap * sizeof(*new_jobs));
+			if (!new_jobs) {
+				xfree(jobs);
+				return -1;
+			}
+			jobs = new_jobs;
+			cap_jobs = new_cap;
+		}
+
+		jobs[nr_jobs++] = &unique[i];
+	}
+
+	*jobs_out = jobs;
+	return nr_jobs;
+}
+
+static void *memfd_open_worker(void *arg)
+{
+	struct memfd_open_plan *plan = arg;
+
+	while (1) {
+		struct open_vma_unique *job;
+		int idx;
+		int fd;
+
+		pthread_mutex_lock(&plan->lock);
+		if (plan->stop || plan->next_job >= plan->nr_jobs) {
+			pthread_mutex_unlock(&plan->lock);
+			break;
+		}
+		idx = plan->next_job++;
+		job = plan->jobs[idx];
+		pthread_mutex_unlock(&plan->lock);
+
+		if (!inherited_fd(job->vmfd, &fd))
+			fd = memfd_open(job->vmfd, &job->flags, true);
+		if (fd < 0) {
+			pthread_mutex_lock(&plan->lock);
+			plan->stop = 1;
+			plan->ret = -1;
+			pthread_mutex_unlock(&plan->lock);
+			break;
+		}
+
+		job->fd = fd;
+	}
+
+	return NULL;
+}
+
+static int memfd_open_parallel(struct open_vma_unique *unique, int nr_unique)
+{
+	struct open_vma_unique **jobs = NULL;
+	struct memfd_open_plan plan;
+	pthread_t workers[OPEN_VMAS_MEMFD_WORKERS_MAX];
+	long cpus;
+	int nr_jobs, nr_workers, i;
+
+	nr_jobs = memfd_open_jobs_collect(unique, nr_unique, &jobs);
+	if (nr_jobs < 0)
+		return -1;
+	if (nr_jobs <= 1) {
+		int ret = 0;
+
+		if (nr_jobs == 1) {
+			int fd;
+
+			if (!inherited_fd(jobs[0]->vmfd, &fd))
+				fd = memfd_open(jobs[0]->vmfd, &jobs[0]->flags, true);
+			if (fd < 0)
+				ret = -1;
+			else
+				jobs[0]->fd = fd;
+		}
+
+		xfree(jobs);
+		return ret;
+	}
+
+	cpus = sysconf(_SC_NPROCESSORS_ONLN);
+	if (cpus < 1)
+		cpus = 1;
+	nr_workers = min_t(int, nr_jobs, cpus);
+	nr_workers = min_t(int, nr_workers, OPEN_VMAS_MEMFD_WORKERS_MAX);
+	if (nr_workers < 2) {
+		int ret = 0;
+
+		for (i = 0; i < nr_jobs; i++) {
+			int fd;
+
+			if (!inherited_fd(jobs[i]->vmfd, &fd))
+				fd = memfd_open(jobs[i]->vmfd, &jobs[i]->flags, true);
+			if (fd < 0) {
+				ret = -1;
+				break;
+			}
+			jobs[i]->fd = fd;
+		}
+
+		xfree(jobs);
+		return ret;
+	}
+
+	memzero(&plan, sizeof(plan));
+	plan.jobs = jobs;
+	plan.nr_jobs = nr_jobs;
+	pthread_mutex_init(&plan.lock, NULL);
+
+	pr_info("open_vmas: opening %d unique memfd inodes with %d workers\n", nr_jobs, nr_workers);
+	for (i = 0; i < nr_workers; i++) {
+		if (pthread_create(&workers[i], NULL, memfd_open_worker, &plan) != 0) {
+			int j, k;
+
+			plan.stop = 1;
+			for (j = 0; j < i; j++)
+				pthread_join(workers[j], NULL);
+			for (k = 0; k < nr_jobs; k++) {
+				if (jobs[k]->fd >= 0) {
+					close(jobs[k]->fd);
+					jobs[k]->fd = -1;
+				}
+			}
+			pthread_mutex_destroy(&plan.lock);
+			xfree(jobs);
+			pr_err("pthread_create failed for memfd open worker\n");
+			return -1;
+		}
+	}
+
+	for (i = 0; i < nr_workers; i++)
+		pthread_join(workers[i], NULL);
+
+	if (plan.ret < 0) {
+		for (i = 0; i < nr_jobs; i++) {
+			if (jobs[i]->fd >= 0) {
+				close(jobs[i]->fd);
+				jobs[i]->fd = -1;
+			}
+		}
+	}
+
+	pthread_mutex_destroy(&plan.lock);
+	xfree(jobs);
+	return plan.ret;
+}
+
 static int open_vmas_unique_open(struct open_vma_unique *unique, int nr_unique)
 {
 	int i, fd;
@@ -1467,8 +1651,14 @@ static int open_vmas_unique_open(struct open_vma_unique *unique, int nr_unique)
 	if (nr_unique <= 0)
 		return 0;
 
+	if (memfd_open_parallel(unique, nr_unique) < 0)
+		return -1;
+
 	for (i = 0; i < nr_unique; i++) {
 		struct open_vma_unique *u = &unique[i];
+
+		if (u->fd >= 0)
+			continue;
 
 		if (u->is_memfd) {
 			if (!inherited_fd(u->vmfd, &fd))

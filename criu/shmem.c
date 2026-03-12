@@ -49,6 +49,7 @@ struct shmem_restore_timing {
 };
 
 static struct shmem_restore_timing shmem_restore_timing;
+static mutex_t shmem_restore_timing_lock;
 
 struct shmem_engine_timing {
 	unsigned long setup_ms;
@@ -87,6 +88,7 @@ static void shmem_timing_add(unsigned long *dst, const struct timeval *from, con
 void shmem_restore_timing_reset(void)
 {
 	memzero(&shmem_restore_timing, sizeof(shmem_restore_timing));
+	mutex_init(&shmem_restore_timing_lock);
 }
 
 void shmem_restore_timing_dump(int pid)
@@ -106,6 +108,7 @@ static void shmem_timing_accumulate(const struct shmem_engine_timing *tim)
 	if (!tim)
 		return;
 
+	mutex_lock(&shmem_restore_timing_lock);
 	shmem_restore_timing.setup_ms += tim->setup_ms;
 	shmem_restore_timing.copy_ms += tim->copy_ms;
 	shmem_restore_timing.sync_ms += tim->sync_ms;
@@ -113,6 +116,7 @@ static void shmem_timing_accumulate(const struct shmem_engine_timing *tim)
 	shmem_restore_timing.async_runs += tim->used_async;
 	shmem_restore_timing.kernel_runs += tim->used_kernel;
 	shmem_restore_timing.worker_runs += tim->used_workers;
+	mutex_unlock(&shmem_restore_timing_lock);
 }
 
 #ifndef SEEK_DATA
@@ -929,7 +933,15 @@ int restore_sysv_shmem_content(void *addr, unsigned long size, unsigned long shm
 
 int restore_memfd_shmem_content(int fd, unsigned long shmid, unsigned long size)
 {
-	return restore_memfd_shmem_content_ex(fd, shmid, size, NULL);
+	struct shmem_engine_timing tim = { 0 };
+	int ret;
+
+	mutex_lock(&shmem_restore_timing_lock);
+	shmem_restore_timing.events++;
+	mutex_unlock(&shmem_restore_timing_lock);
+	ret = restore_memfd_shmem_content_ex(fd, shmid, size, &tim);
+	shmem_timing_accumulate(&tim);
+	return ret;
 }
 
 struct open_map_file_args {

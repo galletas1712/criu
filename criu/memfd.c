@@ -323,6 +323,14 @@ static int memfd_open_inode(struct memfd_restore_inode *inode)
 	return fd;
 }
 
+void *memfd_inode_cookie(struct file_desc *d)
+{
+	struct memfd_info *mfi;
+
+	mfi = container_of(d, struct memfd_info, d);
+	return mfi->inode;
+}
+
 int memfd_open(struct file_desc *d, u32 *fdflags, bool filemap)
 {
 	struct memfd_info *mfi;

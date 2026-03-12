@@ -577,14 +577,19 @@ static int process_async_reads(struct page_read *pr)
 			}
 		}
 
-		if (ret < 0) {
-			pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
-			       piov->end - piov->from, piov->from, piov->nr);
-			return -1;
-		}
+			if (ret < 0) {
+				pr_err("Can't read async pr bytes (%zd / %ju read, %ju off, %d iovs)\n", ret,
+				       piov->end - piov->from, piov->from, piov->nr);
+				return -1;
+			}
+			if (ret == 0) {
+				pr_err("Unexpected EOF in async page read (%ju bytes remaining at off %ju, %d iovs)\n",
+				       piov->end - piov->from, piov->from, piov->nr);
+				return -1;
+			}
 
-		if (opts.auto_dedup && punch_hole(pr, piov->from, ret, false))
-			return -1;
+			if (opts.auto_dedup && punch_hole(pr, piov->from, ret, false))
+				return -1;
 
 		if (ret != piov->end - piov->from) {
 			/*

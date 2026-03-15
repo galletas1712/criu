@@ -829,8 +829,9 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 			char *endptr;
 			long accel = strtol(optarg, &endptr, 10);
 
-			if (*endptr != '\0' || accel < 1 || accel > 65537) {
-				pr_err("Invalid --compress-acceleration value '%s' (must be 1..65537)\n", optarg);
+			if (*endptr != '\0' || accel < 1 || accel > LZ4_MAX_ACCELERATION) {
+				pr_err("Invalid --compress-acceleration value '%s' (must be 1..%d)\n",
+				       optarg, LZ4_MAX_ACCELERATION);
 				return 1;
 			}
 			opts.compress_acceleration = accel;

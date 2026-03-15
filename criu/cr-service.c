@@ -834,9 +834,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	}
 
 	if (req->has_compress_acceleration && req->compress_acceleration > 0) {
-		if (req->compress_acceleration > 65537) {
-			pr_err("Invalid compress_acceleration value %u (must be 1..65537)\n",
-			       req->compress_acceleration);
+		if (req->compress_acceleration > LZ4_MAX_ACCELERATION) {
+			pr_err("Invalid compress_acceleration value %u (must be 1..%d)\n",
+			       req->compress_acceleration, LZ4_MAX_ACCELERATION);
 			goto err;
 		}
 		opts.compress_acceleration = req->compress_acceleration;

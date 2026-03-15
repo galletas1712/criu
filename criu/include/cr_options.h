@@ -231,7 +231,7 @@ struct cr_options {
 	/*
 	 * LZ4 acceleration level for page compression.
 	 * Internal: 0 means the user did not set a value (default acceleration).
-	 * CLI/RPC accept 1..65537 (higher = faster, lower ratio).
+	 * CLI/RPC accept 1..LZ4_MAX_ACCELERATION (higher = faster, lower ratio).
 	 */
 	unsigned int compress_acceleration;
 

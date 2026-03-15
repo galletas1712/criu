@@ -52,8 +52,9 @@ enum compress_mode {
  * Higher values skip more match candidates, resulting in
  * faster compression but fewer and shorter matches.
  * Decompression speed is not affected (~4970 MB/s always).
- * Valid range: 1 to LZ4_ACCELERATION_MAX (65537).
+ * Valid range: 1 to LZ4_MAX_ACCELERATION.
  */
+#define LZ4_MAX_ACCELERATION	65537
 #define LZ4_DEFAULT_ACCELERATION 1
 
 /*

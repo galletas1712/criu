@@ -3,3 +3,7 @@
 *.txt
 stats-*
 *.json
+comp/
+uncomp/
+cdc/
+dcd/

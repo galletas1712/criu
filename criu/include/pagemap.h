@@ -99,6 +99,21 @@ struct page_read {
 	/* Current offset in pages file */
 	off_t pi_off;
 
+	/*
+	 * Index into pe->compressed_size[] for the current pagemap
+	 * entry. Tracks which compressed block (page in per-page mode,
+	 * region in region mode) we are on when reading or skipping
+	 * compressed pages. Reset to 0 on advance().
+	 */
+	size_t compressed_size_index;
+
+	/*
+	 * In region mode: pages already consumed (read or skipped) from
+	 * the current block. Always 0 in per-page mode. Reset to 0 on
+	 * advance() and whenever the reader crosses a block boundary.
+	 */
+	unsigned int region_block_offset;
+
 	/* Record consequent neighbour iov-ecs to punch together */
 	struct iovec bunch;
 

@@ -465,7 +465,9 @@ ruff:
 		scripts/uninstall_module.py \
 		coredump/ coredump/coredump \
 		scripts/github-indent-warnings.py \
-		contrib/criu-service-client/test/*.py
+		contrib/criu-service-client/test/*.py \
+		contrib/compression-benchmark/main.py \
+		contrib/compression-benchmark/workload.py
 
 shellcheck:
 	shellcheck --version

@@ -14,4 +14,12 @@ message pagemap_entry {
 	optional bool	in_parent	= 3;
 	optional uint32	flags		= 4 [(criu).flags = "pmap.flags" ];
 	optional uint64 nr_pages = 5;
+	repeated uint32 compressed_size		= 6;
+	optional uint64	total_compressed_size	= 7;
+	/*
+	 * If set and > 0, compressed_size[] holds one element per region of
+	 * region_pages pages (the last region may be shorter than nr_pages %
+	 * region_pages). If unset or 0, compressed_size[] is per-page.
+	 */
+	optional uint32 region_pages		= 8;
 }

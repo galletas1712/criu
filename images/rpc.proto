@@ -145,6 +145,12 @@ message criu_opts {
 	optional bool			leave_stopped		= 69;
 	optional bool			display_stats		= 70;
 	optional bool			log_to_stderr		= 71;
+	/*
+	 * Memory page compression mode (enum compress_mode):
+	 *   0 = off, 1 = per-page, 2 = region. Default 0.
+	 */
+	optional uint32			compress		= 72;
+	optional uint32			compress_acceleration	= 73;
 /*	optional bool			check_mounts		= 128;	*/
 }
 

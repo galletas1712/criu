@@ -19,6 +19,7 @@
 #include "proc_parse.h"
 #include "img-streamer.h"
 #include "namespaces.h"
+#include "compression.h"
 
 bool ns_per_id = false;
 bool img_common_magic = true;
@@ -144,6 +145,62 @@ int check_img_inventory(bool restore)
 			dump_criu_run_id[0] = NO_DUMP_CRIU_RUN_ID;
 		}
 
+	}
+
+	if (he->has_compress) {
+		opts.compress_mode = he->compress;
+		if (he->has_compress_acceleration)
+			opts.compress_acceleration = he->compress_acceleration;
+		if (he->has_compress_region_size)
+			opts.compress_region_size = he->compress_region_size;
+
+		/*
+		 * On restore the compression mode usually comes from the
+		 * image inventory rather than the command line, so it is
+		 * not known when check_options() runs. Re-validate the
+		 * restore-path constraints here, once the mode is known.
+		 */
+		if (restore && opts.compress_mode) {
+#ifndef CONFIG_LZ4
+			pr_err("Image uses memory page compression but CRIU was built without LZ4 support (CONFIG_LZ4)\n");
+			goto out_err;
+#else
+			if (opts.compress_mode > COMPRESS_REGION) {
+				pr_err("Image has unknown compression mode %d\n", opts.compress_mode);
+				goto out_err;
+			}
+			/*
+			 * The image-streamer and page-server/remote restore
+			 * readers only understand the per-page wire format.
+			 * A region-compressed image must use the local
+			 * restore path.
+			 */
+			if (opts.compress_mode == COMPRESS_REGION) {
+				if (opts.stream) {
+					pr_err("Region-compressed image cannot be restored with --stream\n");
+					goto out_err;
+				}
+				if (opts.use_page_server || opts.addr) {
+					pr_err("Region-compressed image cannot be restored via page-server\n");
+					goto out_err;
+				}
+			}
+#endif
+		}
+
+		if (opts.compress_mode == COMPRESS_REGION)
+			pr_debug("Region decompression of memory pages is enabled\n");
+		else if (opts.compress_mode == COMPRESS_PER_PAGE)
+			pr_debug("Per-page decompression of memory pages is enabled\n");
+	} else if (restore) {
+		/*
+		 * Image without compression metadata (e.g. an older image).
+		 * Clear any compression mode so a stale setting cannot make
+		 * the compressed reader misinterpret uncompressed pages.
+		 */
+		opts.compress_mode = COMPRESS_OFF;
+		opts.compress_acceleration = 0;
+		opts.compress_region_size = 0;
 	}
 
 	ret = 0;
@@ -401,6 +458,19 @@ int prepare_inventory(InventoryEntry *he)
 
 	if (!he->dump_criu_run_id)
 		return -1;
+
+	he->has_compress = true;
+	he->compress = opts.compress_mode;
+
+	if (opts.compress_acceleration) {
+		he->has_compress_acceleration = true;
+		he->compress_acceleration = opts.compress_acceleration;
+	}
+
+	if (opts.compress_mode == COMPRESS_REGION && opts.compress_region_size) {
+		he->has_compress_region_size = true;
+		he->compress_region_size = opts.compress_region_size;
+	}
 
 	return 0;
 }

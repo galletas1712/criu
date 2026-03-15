@@ -42,4 +42,7 @@ message inventory_entry {
 	 * Absent or 0 means no compression was applied to the dump.
 	 */
 	optional uint32			compress = 15;
+	optional uint32			compress_acceleration = 16;
+	/* Region size in bytes when compress = 2. Informational. */
+	optional uint32			compress_region_size = 17;
 }

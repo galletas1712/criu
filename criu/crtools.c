@@ -552,6 +552,17 @@ usage:
 	       "                        will be punched from the image\n"
 	       "  --pre-dump-mode       splice - parasite based pre-dumping (default)\n"
 	       "                        read   - process_vm_readv syscall based pre-dumping\n"
+#ifdef CONFIG_LZ4
+	       "  -c|--compress         enable LZ4 per-page compression of memory pages\n"
+	       "  --compress-region size\n"
+	       "                        enable memory page compression for given region size;\n"
+	       "                        size accepts K/M/G suffixes (e.g. 256K, 1M);\n"
+	       "                        valid range is a multiple of 4096 up to 4M\n"
+	       "  --compress-acceleration N\n"
+	       "                        LZ4 acceleration (default is 1; max is 65537).\n"
+	       "                        Higher values favor speed over compression ratio.\n"
+	       "                        Implies --compress unless --compress-region is set.\n"
+#endif
 	       "\n"
 	       "Page/Service server options:\n"
 	       "  --address ADDR        address of server or service\n"

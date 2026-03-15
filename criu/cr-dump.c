@@ -61,6 +61,7 @@
 #include "cgroup-props.h"
 #include "file-lock.h"
 #include "page-xfer.h"
+#include "compression.h"
 #include "kerndat.h"
 #include "stats.h"
 #include "mem.h"
@@ -1854,6 +1855,19 @@ static int cr_pre_dump_finish(int status)
 
 	he.has_pre_dump_mode = true;
 	he.pre_dump_mode = opts.pre_dump_mode;
+
+	he.has_compress = true;
+	he.compress = opts.compress_mode;
+
+	if (opts.compress_acceleration) {
+		he.has_compress_acceleration = true;
+		he.compress_acceleration = opts.compress_acceleration;
+	}
+
+	if (opts.compress_mode == COMPRESS_REGION && opts.compress_region_size) {
+		he.has_compress_region_size = true;
+		he.compress_region_size = opts.compress_region_size;
+	}
 
 	pstree_switch_state(root_item, TASK_ALIVE);
 

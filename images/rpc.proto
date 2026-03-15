@@ -151,6 +151,7 @@ message criu_opts {
 	 */
 	optional uint32			compress		= 72;
 	optional uint32			compress_acceleration	= 73;
+	optional uint32			compress_region_size	= 74;
 /*	optional bool			check_mounts		= 128;	*/
 }
 

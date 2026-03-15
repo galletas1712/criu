@@ -75,8 +75,16 @@ test_stream() {
 	# restorer and eventually close the page read. However, image-streamer expects the
 	# whole image to be read and the image is not reopened, sent twice. These MAP_HUGETLB
 	# test cases will result in EPIPE error at the moment.
-	STREAM_TEST_EXCLUDE=(-x maps09 -x maps10)
+	# Region compression (--compress-region) is incompatible with the
+	# per-page image-streamer wire format, so exclude those tests from
+	# the streamed run (they are covered by the local -a runs).
+	STREAM_TEST_EXCLUDE=(-x maps09 -x maps10
+		-x compress_pages_region00
+		-x compress_pages_region01
+		-x compress_pages_region02)
 	./test/zdtm.py run --stream -p 2 --keep-going -a "${STREAM_TEST_EXCLUDE[@]}" "${ZDTM_OPTS[@]}"
+	./test/zdtm.py run --stream --compress -t zdtm/static/maps00 -t zdtm/static/env00
+	./test/zdtm.py run --stream -t zdtm/static/compress_pages00 -t zdtm/static/compress_pages01 -t zdtm/static/compress_pages02
 }
 
 print_header() {
@@ -246,6 +254,7 @@ run_non_shardable_tests() {
 	./test/zdtm.py run "${LAZY_OPTS[@]}" --lazy-pages
 	./test/zdtm.py run "${LAZY_OPTS[@]}" --remote-lazy-pages
 	./test/zdtm.py run "${LAZY_OPTS[@]}" --remote-lazy-pages --tls
+	./test/zdtm.py run -t zdtm/static/maps00 --lazy-pages --compress
 
 	bash -x ./test/jenkins/criu-fault.sh
 	if [ "$UNAME_M" == "x86_64" ]; then
@@ -284,6 +293,39 @@ run_non_shardable_tests() {
 	./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --page-server
 	./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --page-server --dedup
 	./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --pre-dump-mode read
+
+	# Memory pages compression
+	./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --compress
+	./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --compress --dedup
+	./test/zdtm.py run -t zdtm/transition/maps007 --pre 2 --compress --page-server
+
+	# Compression page content integrity across different modes
+	./test/zdtm.py run -t zdtm/static/compress_pages00 -t zdtm/static/compress_pages01 -t zdtm/static/compress_pages02
+	./test/zdtm.py run -t zdtm/static/compress_pages00 --pre 2
+	./test/zdtm.py run -t zdtm/static/compress_pages01 --pre 2
+	./test/zdtm.py run -t zdtm/static/compress_pages00 --page-server
+	./test/zdtm.py run -t zdtm/static/compress_pages01 --page-server
+	./test/zdtm.py run -t zdtm/static/compress_pages00 --dedup
+	./test/zdtm.py run -t zdtm/static/compress_pages00 --lazy-pages
+
+	# Region-compression incremental and dedup restore paths. The base
+	# region tests run automatically in the local -a runs; here we add the
+	# --pre 2 (parent chain) and --dedup variants that -a does not cover.
+	./test/zdtm.py run -t zdtm/static/compress_pages_region00 --pre 2
+	./test/zdtm.py run -t zdtm/static/compress_pages_region00 --dedup
+
+	# Hugetlb mappings are not premapped, so they are restored through the
+	# PIE restorer's decompression daemon (process_vm_writev path) rather
+	# than the in-criu reader. maps09 exercises that daemon for both the
+	# per-page and region wire formats. It is skipped automatically when
+	# the host has no huge pages (maps09.checkskip).
+	./test/zdtm.py run -t zdtm/static/maps09 --compress
+	./test/zdtm.py run -t zdtm/static/maps09 --compress-region 256K
+
+	# Mixed-compression parent chain (uncompressed pre-dumps + compressed dump)
+	if criu/criu check --feature compress; then
+		make -C test/others/compress-mixed run
+	fi
 
 	./test/zdtm.py run -t zdtm/transition/pid_reuse --pre 2 # start time based pid reuse detection
 	./test/zdtm.py run -t zdtm/transition/pidfd_store_sk --rpc --pre 2 # pidfd based pid reuse detection

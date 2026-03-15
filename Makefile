@@ -478,6 +478,7 @@ shellcheck:
 	shellcheck -x test/others/config-file/*.sh
 	shellcheck -x test/others/action-script/*.sh
 	shellcheck -x contrib/criu-service-client/test/*.sh
+	shellcheck -x test/others/compress-mixed/*.sh
 
 codespell:
 	codespell

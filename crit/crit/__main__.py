@@ -361,6 +361,307 @@ def explore(opts):
     explorers[opts['what']](opts)
 
 
+PAGE_SIZE = 4096
+ZERO_PAGE = b'\0' * PAGE_SIZE
+
+
+def _find_pagemaps(d):
+    """Find all pagemap files and their associated pages files."""
+    pairs = []
+    seen_pages_ids = set()
+
+    for name in sorted(os.listdir(d)):
+        if not (name.startswith('pagemap-') or
+                name.startswith('pagemap-shmem-')):
+            continue
+        if not name.endswith('.img'):
+            continue
+
+        path = os.path.join(d, name)
+        with open(path, 'rb') as f:
+            pm = pycriu.images.load(f)
+
+        if not pm['entries']:
+            continue
+
+        pages_id = pm['entries'][0].get('pages_id')
+        if pages_id is None or pages_id in seen_pages_ids:
+            continue
+        seen_pages_ids.add(pages_id)
+
+        pages_name = 'pages-%d.img' % pages_id
+        pages_path = os.path.join(d, pages_name)
+        if not os.path.exists(pages_path):
+            continue
+
+        pairs.append((name, pages_name, pm))
+
+    return pairs
+
+
+def _get_nr_pages(entry):
+    return entry.get('nr_pages', entry.get('compat_nr_pages', 0))
+
+
+def _backup(path):
+    bak = path + '.bak'
+    os.rename(path, bak)
+    return bak
+
+
+def compress_cmd(opts):
+    try:
+        import lz4.block
+    except ImportError:
+        print("Error: lz4 Python package is required.\n"
+              "Install with: pip install lz4", file=sys.stderr)
+        sys.exit(1)
+
+    d = opts['dir']
+    in_place = opts.get('in_place', False)
+    acceleration = opts.get('acceleration', 1)
+
+    inv_path = os.path.join(d, 'inventory.img')
+    with open(inv_path, 'rb') as f:
+        inv = pycriu.images.load(f)
+
+    if inv['entries'][0].get('compress'):
+        print("Checkpoint in %s is already compressed" % d)
+        return
+
+    pairs = _find_pagemaps(d)
+    if not pairs:
+        print("No pagemap files found in %s" % d)
+        return
+
+    print("Compressing checkpoint in %s" % d)
+
+    for pm_name, pages_name, pm in pairs:
+        pm_path = os.path.join(d, pm_name)
+        pages_path = os.path.join(d, pages_name)
+        tmp_pages = pages_path + '.tmp'
+
+        total_pages = 0
+        orig_size = 0
+        comp_size = 0
+
+        with open(pages_path, 'rb') as pages_in, \
+             open(tmp_pages, 'wb') as pages_out:
+
+            for entry in pm['entries'][1:]:
+                nr = _get_nr_pages(entry)
+                flags = entry.get('flags', 0)
+
+                # Skip parent references (no data in pages file)
+                if flags & 0x1 and not (flags & 0x4):
+                    continue
+
+                compressed_sizes = []
+                total_cs = 0
+
+                for _ in range(nr):
+                    page = pages_in.read(PAGE_SIZE)
+                    if len(page) != PAGE_SIZE:
+                        print("Error: short read in %s" % pages_name,
+                              file=sys.stderr)
+                        os.unlink(tmp_pages)
+                        sys.exit(1)
+
+                    orig_size += PAGE_SIZE
+                    total_pages += 1
+
+                    if page == ZERO_PAGE:
+                        compressed_sizes.append(0)
+                    else:
+                        comp = lz4.block.compress(
+                            page, store_size=False,
+                            acceleration=acceleration)
+                        if len(comp) >= PAGE_SIZE:
+                            pages_out.write(page)
+                            compressed_sizes.append(PAGE_SIZE)
+                            total_cs += PAGE_SIZE
+                            comp_size += PAGE_SIZE
+                        else:
+                            pages_out.write(comp)
+                            compressed_sizes.append(len(comp))
+                            total_cs += len(comp)
+                            comp_size += len(comp)
+
+                entry['compressed_size'] = compressed_sizes
+                entry['total_compressed_size'] = total_cs
+
+        if not in_place:
+            _backup(pages_path)
+            _backup(pm_path)
+
+        os.rename(tmp_pages, pages_path)
+        with open(pm_path, 'wb') as f:
+            pycriu.images.dump(pm, f)
+
+        if orig_size > 0:
+            saved = (1 - comp_size / orig_size) * 100
+            print("  %s: %d pages (%dK -> %dK, %.1f%% saved)" %
+                  (pm_name, total_pages,
+                   orig_size // 1024, comp_size // 1024, saved))
+
+    inv['entries'][0]['compress'] = 1  # COMPRESS_PER_PAGE
+    if acceleration != 1:
+        inv['entries'][0]['compress_acceleration'] = acceleration
+
+    if not in_place:
+        _backup(inv_path)
+
+    with open(inv_path, 'wb') as f:
+        pycriu.images.dump(inv, f)
+
+    print("Done")
+
+
+def decompress_cmd(opts):
+    try:
+        import lz4.block
+    except ImportError:
+        print("Error: lz4 Python package is required.\n"
+              "Install with: pip install lz4", file=sys.stderr)
+        sys.exit(1)
+
+    d = opts['dir']
+    in_place = opts.get('in_place', False)
+
+    inv_path = os.path.join(d, 'inventory.img')
+    with open(inv_path, 'rb') as f:
+        inv = pycriu.images.load(f)
+
+    if not inv['entries'][0].get('compress'):
+        print("Checkpoint in %s is already decompressed" % d)
+        return
+
+    pairs = _find_pagemaps(d)
+    if not pairs:
+        print("No pagemap files found in %s" % d)
+        return
+
+    print("Decompressing checkpoint in %s" % d)
+
+    for pm_name, pages_name, pm in pairs:
+        pm_path = os.path.join(d, pm_name)
+        pages_path = os.path.join(d, pages_name)
+        tmp_pages = pages_path + '.tmp'
+
+        total_pages = 0
+        comp_size = 0
+        orig_size = 0
+
+        with open(pages_path, 'rb') as pages_in, \
+             open(tmp_pages, 'wb') as pages_out:
+
+            for entry in pm['entries'][1:]:
+                nr = _get_nr_pages(entry)
+                flags = entry.get('flags', 0)
+
+                if flags & 0x1 and not (flags & 0x4):
+                    continue
+
+                cs_list = entry.get('compressed_size')
+
+                if not cs_list:
+                    # Uncompressed entry, copy through
+                    data = pages_in.read(nr * PAGE_SIZE)
+                    pages_out.write(data)
+                    orig_size += len(data)
+                    comp_size += len(data)
+                    total_pages += nr
+                else:
+                    # region_pages > 0 means each compressed_size entry
+                    # covers up to region_pages pages as one LZ4 block
+                    # (the last block of an entry may be shorter). 0 or
+                    # absent means per-page compression (one page each).
+                    region_pages = entry.get('region_pages', 0)
+                    remaining = nr
+
+                    for cs in cs_list:
+                        if region_pages:
+                            block_pages = min(region_pages, remaining)
+                        else:
+                            block_pages = 1
+                        block_bytes = block_pages * PAGE_SIZE
+                        total_pages += block_pages
+                        remaining -= block_pages
+
+                        if cs == 0:
+                            pages_out.write(ZERO_PAGE * block_pages)
+                            orig_size += block_bytes
+                        elif cs == block_bytes:
+                            # Stored raw, copy through verbatim
+                            data = pages_in.read(cs)
+                            if len(data) != cs:
+                                print("Error: short read in %s" %
+                                      pages_name, file=sys.stderr)
+                                os.unlink(tmp_pages)
+                                sys.exit(1)
+                            pages_out.write(data)
+                            orig_size += block_bytes
+                            comp_size += cs
+                        else:
+                            data = pages_in.read(cs)
+                            if len(data) != cs:
+                                print("Error: short read in %s" %
+                                      pages_name, file=sys.stderr)
+                                os.unlink(tmp_pages)
+                                sys.exit(1)
+                            try:
+                                page = lz4.block.decompress(
+                                    data, uncompressed_size=block_bytes)
+                            except Exception as e:
+                                print("Error: decompression failed "
+                                      "in %s: %s" % (pages_name, e),
+                                      file=sys.stderr)
+                                os.unlink(tmp_pages)
+                                sys.exit(1)
+                            pages_out.write(page)
+                            orig_size += block_bytes
+                            comp_size += cs
+
+                    if remaining != 0:
+                        print("Error: block page count mismatch in %s "
+                              "(%d pages unaccounted)" %
+                              (pages_name, remaining), file=sys.stderr)
+                        os.unlink(tmp_pages)
+                        sys.exit(1)
+
+                    # Remove compression metadata
+                    if 'compressed_size' in entry:
+                        del entry['compressed_size']
+                    if 'total_compressed_size' in entry:
+                        del entry['total_compressed_size']
+                    if 'region_pages' in entry:
+                        del entry['region_pages']
+
+        if not in_place:
+            _backup(pages_path)
+            _backup(pm_path)
+
+        os.rename(tmp_pages, pages_path)
+        with open(pm_path, 'wb') as f:
+            pycriu.images.dump(pm, f)
+
+        print("  %s: %d pages (%dK -> %dK)" %
+              (pm_name, total_pages,
+               comp_size // 1024, orig_size // 1024))
+
+    inv['entries'][0].pop('compress', None)
+    inv['entries'][0].pop('compress_acceleration', None)
+    inv['entries'][0].pop('compress_region_size', None)
+
+    if not in_place:
+        _backup(inv_path)
+
+    with open(inv_path, 'wb') as f:
+        pycriu.images.dump(inv, f)
+
+    print("Done")
+
+
 def main():
     desc = 'CRiu Image Tool'
     parser = argparse.ArgumentParser(
@@ -419,6 +720,24 @@ def main():
                              help='do not show entry payload (if exists)',
                              action='store_true')
     show_parser.set_defaults(func=decode, pretty=True, out=None)
+
+    # Compress
+    compress_parser = subparsers.add_parser(
+        'compress', help='Compress memory pages in a checkpoint directory')
+    compress_parser.add_argument('dir')
+    compress_parser.add_argument('--in-place', action='store_true',
+                                 help='Skip creating backup files')
+    compress_parser.add_argument('--acceleration', type=int, default=1,
+                                 help='LZ4 acceleration (1=default, higher=faster)')
+    compress_parser.set_defaults(func=compress_cmd)
+
+    # Decompress
+    decompress_parser = subparsers.add_parser(
+        'decompress', help='Decompress memory pages in a checkpoint directory')
+    decompress_parser.add_argument('dir')
+    decompress_parser.add_argument('--in-place', action='store_true',
+                                    help='Skip creating backup files')
+    decompress_parser.set_defaults(func=decompress_cmd)
 
     opts = vars(parser.parse_args())
 

@@ -16,6 +16,7 @@ dnf install -y \
 	libbsd-devel \
 	libcap-devel \
 	libdrm-devel \
+	lz4-devel \
 	libnet-devel \
 	libnl3-devel \
 	libselinux-devel \
@@ -32,6 +33,7 @@ dnf install -y \
 	protobuf-devel \
 	python-devel \
 	python3-importlib-metadata \
+	python3-lz4 \
 	python3-protobuf \
 	python3-pyyaml \
 	python3-setuptools \

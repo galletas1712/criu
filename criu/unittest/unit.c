@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <assert.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -9,6 +10,8 @@
 #include "util.h"
 #include "criu-log.h"
 #include "bfd.h"
+#include "compression.h"
+#include "page.h"
 
 int parse_statement(int i, char *line, char **configuration);
 
@@ -91,6 +94,149 @@ static void test_bwrite(void)
 	free(buf);
 	free(read_buf);
 }
+
+#ifdef CONFIG_LZ4
+static void test_compress_roundtrip(const char *page, int acceleration)
+{
+	char compressed[PAGE_COMPRESSED_SIZE_BOUND];
+	char decompressed[PAGE_SIZE];
+	int cs;
+
+	cs = compress_data(page, PAGE_SIZE, compressed,
+			   PAGE_COMPRESSED_SIZE_BOUND, acceleration);
+	assert(cs > 0);
+	assert(cs <= PAGE_COMPRESSED_SIZE_BOUND);
+	assert(decompress_data(compressed, cs, PAGE_SIZE, decompressed) == 0);
+	assert(memcmp(page, decompressed, PAGE_SIZE) == 0);
+}
+
+static void test_compression(void)
+{
+	char cbuf[PAGE_COMPRESSED_SIZE_BOUND];
+	char page[PAGE_SIZE];
+	const int accels[] = { 1, 4, 100 };
+
+	/* Zero-page detection */
+	memset(page, 0, PAGE_SIZE);
+	assert(page_is_all_zero(page) == true);
+	page[PAGE_SIZE - 1] = 1;
+	assert(page_is_all_zero(page) == false);
+	page[PAGE_SIZE - 1] = 0;
+	page[0] = 0x42;
+	assert(page_is_all_zero(page) == false);
+
+
+	for (int a = 0; a < 3; a++) {
+		int accel = accels[a];
+		int cs;
+
+		/* Zero-filled page: should compress well */
+		memset(cbuf, 0, sizeof(cbuf));
+		memset(page, 0, PAGE_SIZE);
+		cs = compress_data(page, PAGE_SIZE,
+				   cbuf, PAGE_COMPRESSED_SIZE_BOUND, accel);
+		assert(cs > 0 && cs < PAGE_SIZE);
+		test_compress_roundtrip(page, accel);
+
+		/* Repeating pattern */
+		for (int i = 0; i < PAGE_SIZE; i++)
+			page[i] = i & 0xff;
+		test_compress_roundtrip(page, accel);
+
+		/* Pseudo-random data (incompressible) */
+		srand(42);
+		for (int i = 0; i < PAGE_SIZE; i++)
+			page[i] = rand() & 0xff;
+		test_compress_roundtrip(page, accel);
+
+		/* Single non-zero byte */
+		memset(cbuf, 0, sizeof(cbuf));
+		memset(page, 0, PAGE_SIZE);
+		page[0] = 0x42;
+		cs = compress_data(page, PAGE_SIZE,
+				   cbuf, PAGE_COMPRESSED_SIZE_BOUND, accel);
+		assert(cs > 0 && cs < PAGE_SIZE);
+		test_compress_roundtrip(page, accel);
+	}
+}
+
+static void test_region_roundtrip(const char *src, unsigned int n_pages,
+				  int acceleration)
+{
+	size_t region_bytes = (size_t)n_pages * PAGE_SIZE;
+	size_t cap = REGION_COMPRESSED_SIZE_BOUND(n_pages);
+	char *cbuf = malloc(cap);
+	char *dec = malloc(region_bytes);
+	int cs;
+
+	assert(cbuf && dec);
+	cs = compress_region(src, n_pages, cbuf, cap, acceleration);
+	assert(cs >= 0);
+	assert((size_t)cs <= region_bytes);
+	assert(decompress_region(cbuf, cs, n_pages, dec) == 0);
+	assert(memcmp(src, dec, region_bytes) == 0);
+
+	free(cbuf);
+	free(dec);
+}
+
+static void test_region_compression(void)
+{
+	unsigned int sizes[] = { 16, 64, 256 };
+	const int accels[] = { 1, 4, 32 };
+	unsigned int s, a;
+
+	for (s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++) {
+		unsigned int n_pages = sizes[s];
+		size_t region_bytes = (size_t)n_pages * PAGE_SIZE;
+		char *src = malloc(region_bytes);
+		size_t cap = REGION_COMPRESSED_SIZE_BOUND(n_pages);
+		char *cbuf = malloc(cap);
+		size_t i;
+
+		assert(src && cbuf);
+
+		for (a = 0; a < sizeof(accels) / sizeof(accels[0]); a++) {
+			int accel = accels[a];
+			int cs;
+
+			/* All-zero region: must short-circuit to 0 bytes. */
+			memset(src, 0, region_bytes);
+			cs = compress_region(src, n_pages, cbuf, cap, accel);
+			assert(cs == 0);
+			test_region_roundtrip(src, n_pages, accel);
+
+			/* Repeating pattern: should compress well. */
+			for (i = 0; i < region_bytes; i++)
+				src[i] = (char)(i & 0xff);
+			cs = compress_region(src, n_pages, cbuf, cap, accel);
+			assert(cs > 0);
+			assert((size_t)cs < region_bytes);
+			test_region_roundtrip(src, n_pages, accel);
+
+			/* Pseudo-random: store-raw fallback expected. */
+			srand(42 + a);
+			for (i = 0; i < region_bytes; i++)
+				src[i] = (char)(rand() & 0xff);
+			cs = compress_region(src, n_pages, cbuf, cap, accel);
+			assert(cs > 0);
+			assert((size_t)cs <= region_bytes);
+			test_region_roundtrip(src, n_pages, accel);
+
+			/* Mostly zeros with one non-zero island. */
+			memset(src, 0, region_bytes);
+			memset(src + region_bytes / 2, 0xab, PAGE_SIZE);
+			cs = compress_region(src, n_pages, cbuf, cap, accel);
+			assert(cs > 0);
+			assert((size_t)cs < region_bytes);
+			test_region_roundtrip(src, n_pages, accel);
+		}
+
+		free(src);
+		free(cbuf);
+	}
+}
+#endif
 
 int main(int argc, char *argv[], char *envp[])
 {
@@ -229,6 +375,11 @@ int main(int argc, char *argv[], char *envp[])
 
 	/* leaves punctuation in returned string as is */
 	assert(!strcmp(get_relative_path("./a////.///./b//././c", "a"), "b//././c"));
+
+#ifdef CONFIG_LZ4
+	test_compression();
+	test_region_compression();
+#endif
 
 	pr_msg("OK\n");
 	return 0;

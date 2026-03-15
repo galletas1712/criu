@@ -138,6 +138,20 @@ typedef long (*thread_restore_fcall_t)(struct thread_restore_args *args);
 struct restore_vma_io {
 	int nr_iovs;
 	loff_t off;
+	uint32_t *compressed_size;
+	uint64_t total_compressed_size;
+	int n_compressed_size;
+	/*
+	 * Region compression metadata. region_pages == 0 means per-page
+	 * compression and block_pages is unused. When region_pages > 0,
+	 * compressed_size[] holds n_compressed_size (== n_blocks) entries
+	 * and block_pages is a parallel uint16_t-per-block array giving
+	 * each block's page count (the last block of any pagemap entry
+	 * spanning this iov may be shorter than region_pages).
+	 */
+	uint32_t region_pages;
+	int n_pages;
+	uint16_t *block_pages;
 	struct iovec iovs[0];
 };
 
@@ -247,6 +261,16 @@ struct task_restore_args {
 	 * unregister it before memory restoration procedure
 	 */
 	struct rst_rseq_param libc_rseq;
+
+	/*
+	 * enum compress_mode value. 0 means no compression — pipes/daemon
+	 * are unused. PIE callers only need the predicate, so we keep this
+	 * as a plain int rather than pulling the enum into PIE headers.
+	 */
+	int compress_mode;
+	int page_pipe_fd_r;
+	int page_pipe_fd_w;
+	pid_t decompress_daemon_pid;
 
 	uid_t uid;
 	u32 cap_eff[CR_CAP_SIZE];

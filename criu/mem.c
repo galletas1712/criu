@@ -35,6 +35,7 @@
 #include "prctl.h"
 #include "compel/infect-util.h"
 #include "pidfd-store.h"
+#include "compression.h"
 
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
@@ -1512,6 +1513,7 @@ int open_vmas(struct pstree_item *t)
 static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 {
 	struct cr_img *pages;
+	int pipe_fds[2][2];
 
 	/*
 	 * We optimize the case when rsti(t)->vma_io is empty.
@@ -1537,7 +1539,13 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		return -1;
 
 	ta->vma_ios_fd = img_raw_fd(pages);
-	if (ta->vma_ios_fd >= 0) {
+	/*
+	 * O_DIRECT requires aligned offset and length. Compressed pages
+	 * are variable-length blocks read at unaligned offsets (by the
+	 * decompression daemon), so O_DIRECT would fail with EINVAL.
+	 * Use buffered I/O for compressed images.
+	 */
+	if (ta->vma_ios_fd >= 0 && !opts.compress_mode) {
 		int direct = probe_pages_o_direct(ta->vma_ios_fd);
 		if (direct < 0) {
 			close_image(pages);
@@ -1545,6 +1553,43 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		}
 		ta->vma_ios_use_direct = (direct == 1);
 	}
+
+	ta->compress_mode = opts.compress_mode;
+	ta->decompress_daemon_pid = -1;
+	if (!ta->compress_mode) {
+		ta->page_pipe_fd_r = -1;
+		ta->page_pipe_fd_w = -1;
+	} else {
+		pid_t helper_pid;
+
+		if (pipe(pipe_fds[0])) {
+			pr_perror("Failed to create pipe");
+			return -1;
+		}
+		if (pipe(pipe_fds[1])) {
+			pr_perror("Failed to create pipe");
+			close(pipe_fds[0][0]);
+			close(pipe_fds[0][1]);
+			return -1;
+		}
+
+		helper_pid = start_vma_io_pipe_daemon(ta->vma_ios_fd, pipe_fds);
+		if (helper_pid < 0) {
+			pr_err("Failed to setup VMA IO pipe\n");
+			close(pipe_fds[0][0]);
+			close(pipe_fds[0][1]);
+			close(pipe_fds[1][0]);
+			close(pipe_fds[1][1]);
+			return -1;
+		}
+
+		close(pipe_fds[0][0]);
+		close(pipe_fds[1][1]);
+		ta->page_pipe_fd_w = pipe_fds[0][1];
+		ta->page_pipe_fd_r = pipe_fds[1][0];
+		ta->decompress_daemon_pid = helper_pid;
+	}
+
 	return pagemap_render_iovec(&rsti(t)->vma_io, ta);
 }
 

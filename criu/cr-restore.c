@@ -3397,6 +3397,18 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	RST_MEM_FIXUP_PPTR(task_args->helpers);
 	RST_MEM_FIXUP_PPTR(task_args->zombies);
 	RST_MEM_FIXUP_PPTR(task_args->vma_ios);
+	{
+		struct restore_vma_io *rio = task_args->vma_ios;
+		unsigned int n;
+
+		for (n = 0; n < task_args->vma_ios_n; n++) {
+			if (rio->compressed_size)
+				RST_MEM_FIXUP_PPTR(rio->compressed_size);
+			if (rio->block_pages)
+				RST_MEM_FIXUP_PPTR(rio->block_pages);
+			rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs));
+		}
+	}
 	RST_MEM_FIXUP_PPTR(task_args->inotify_fds);
 
 	task_args->compatible_mode = core_is_compat(core);

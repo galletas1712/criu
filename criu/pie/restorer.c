@@ -107,6 +107,12 @@ static pid_t *helpers;
 static int n_helpers;
 static pid_t *zombies;
 static int n_zombies;
+/*
+ * PID of the page decompression daemon (a child of this restored task).
+ * It exits on its own once the restorer closes the pipes, so its death
+ * must not be treated as a fatal task failure by sigchld_handler().
+ */
+static pid_t decompress_daemon_pid;
 
 static enum faults fi_strategy;
 bool fault_injected(enum faults f)
@@ -159,6 +165,13 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 	for (i = 0; i < n_zombies; i++)
 		if (siginfo->si_pid == zombies[i])
 			return;
+
+	/*
+	 * The page decompression daemon is expected to exit once the
+	 * restorer is done with it; do not treat that as a task failure.
+	 */
+	if (decompress_daemon_pid > 0 && siginfo->si_pid == decompress_daemon_pid)
+		return;
 
 	if (siginfo->si_code == CLD_EXITED)
 		r = "exited, status=";
@@ -1761,6 +1774,117 @@ static int reap_aio_events(struct task_restore_args *args, aio_context_t aio_ctx
 }
 
 /*
+ * Wire protocol header between the PIE restorer and the helper daemon.
+ * Must match struct pipe_hdr in compression.c.
+ *
+ * region_pages == 0 -> per-page compression (n_blocks == n_pages, no
+ * trailing block_pages array). region_pages > 0 -> region compression:
+ * sizes[] holds n_blocks entries, followed by block_pages[n_blocks]
+ * (uint16_t per block) on the wire before the iovec array.
+ */
+struct pipe_hdr {
+	pid_t remote_pid;
+	off_t offs;
+	uint64_t total_compressed_size;
+	int n_pages;
+	int nr_iovs;
+	int n_blocks;
+	uint32_t region_pages;
+} __attribute__((packed));
+
+/*
+ * Write exactly @size bytes to pipe @fd, handling short writes.
+ * Pipe writes can be short when the pipe buffer fills up
+ * (default 64 KB on Linux), which happens easily with large
+ * compressed_size arrays or iovec arrays.
+ */
+static int pipe_write_full(int fd, const void *buf, size_t size)
+{
+	size_t done = 0;
+
+	while (done < size) {
+		ssize_t ret = sys_write(fd, (const char *)buf + done,
+					size - done);
+		if (ret < 0)
+			return -1;
+		if (ret == 0)
+			return -1;
+		done += ret;
+	}
+	return 0;
+}
+
+/*
+ * Read exactly @size bytes from pipe @fd, handling short reads.
+ */
+static int pipe_read_full(int fd, void *buf, size_t size)
+{
+	size_t done = 0;
+
+	while (done < size) {
+		ssize_t ret = sys_read(fd, (char *)buf + done,
+				       size - done);
+		if (ret < 0)
+			return -1;
+		if (ret == 0)
+			return -1;
+		done += ret;
+	}
+	return 0;
+}
+
+/*
+ * pipe_preadv_limited() delegates page decompression to a helper
+ * process via pipes, since the PIE restorer cannot link against LZ4.
+ *
+ * Protocol (must match start_vma_io_pipe_daemon() in compression.c):
+ *   1. struct pipe_hdr (pid, offs, total_cs, n_pages, nr_iovs, n_blocks, region_pages)
+ *   2. uint32_t compressed_size[n_blocks]
+ *   3. uint16_t block_pages[n_blocks]   (only when region_pages > 0)
+ *   4. struct iovec iovs[nr_iovs]       (remote dest layout)
+ *
+ * Response: ssize_t total_uncompressed_size
+ */
+static ssize_t pipe_preadv_limited(int rfd, int wfd, struct iovec *iovs,
+				   int nr_iovs, off_t offs,
+				   uint32_t *compressed_size, int n_blocks,
+				   int n_pages, uint64_t total_compressed_size,
+				   uint32_t region_pages, uint16_t *block_pages)
+{
+	struct pipe_hdr hdr;
+	ssize_t result;
+
+	hdr.remote_pid = sys_getpid();
+	hdr.offs = offs;
+	hdr.total_compressed_size = total_compressed_size;
+	hdr.n_pages = n_pages;
+	hdr.nr_iovs = nr_iovs;
+	hdr.n_blocks = n_blocks;
+	hdr.region_pages = region_pages;
+
+	if (pipe_write_full(wfd, &hdr, sizeof(hdr)))
+		return -1;
+
+	if (pipe_write_full(wfd, compressed_size,
+			    n_blocks * sizeof(uint32_t)))
+		return -1;
+
+	if (region_pages > 0 &&
+	    pipe_write_full(wfd, block_pages,
+			    n_blocks * sizeof(uint16_t)))
+		return -1;
+
+	if (pipe_write_full(wfd, iovs,
+			    nr_iovs * sizeof(struct iovec)))
+		return -1;
+
+	if (pipe_read_full(rfd, &result, sizeof(ssize_t)))
+		return -1;
+
+	return result;
+}
+
+/*
  * Call preadv() but limit size of the read. Zero `max_to_read` skips the limit.
  */
 static ssize_t preadv_limited(int fd, struct iovec *iovs, int nr, off_t offs, size_t max_to_read)
@@ -2107,6 +2231,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	n_helpers = args->helpers_n;
 	zombies = args->zombies;
 	n_zombies = args->zombies_n;
+	decompress_daemon_pid = args->decompress_daemon_pid;
 #ifdef ARCH_HAS_LONG_PAGES
 	__page_size = args->page_size;
 #endif
@@ -2261,11 +2386,84 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * Both helpers consume args->vma_ios and close args->vma_ios_fd on exit.
 	 */
 	if (args->vma_ios_n > 0 && args->vma_ios_fd != -1) {
-		int rc = args->vma_ios_use_direct
-			? restore_vma_aio(args)
-			: restore_vma_preadv(args);
-		if (rc < 0)
-			goto core_restore_end;
+		if (args->compress_mode) {
+			/*
+			 * For compressed pages, the helper daemon handles
+			 * reading, decompression, and writing to the remote
+			 * process in one shot via process_vm_writev().
+			 */
+			struct restore_vma_io *rio = args->vma_ios;
+
+			for (i = 0; i < args->vma_ios_n; i++) {
+				struct iovec *iovs = rio->iovs;
+				int nr = rio->nr_iovs;
+				ssize_t r;
+				int n_pages = rio->n_pages > 0 ? rio->n_pages :
+								 rio->n_compressed_size;
+
+				pr_debug("Compressed preadv %lx:%d... (%d iovs, %d blocks, %d pages, region=%u)\n",
+					 (unsigned long)iovs->iov_base, (int)iovs->iov_len,
+					 nr, rio->n_compressed_size, n_pages,
+					 rio->region_pages);
+
+				r = pipe_preadv_limited(args->page_pipe_fd_r,
+							args->page_pipe_fd_w,
+							iovs, nr, rio->off,
+							rio->compressed_size,
+							rio->n_compressed_size,
+							n_pages,
+							rio->total_compressed_size,
+							rio->region_pages,
+							rio->block_pages);
+				if (r < 0) {
+					pr_err("Can't decompress pages data (%d)\n", (int)r);
+					goto core_restore_end;
+				}
+
+				rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs));
+			}
+
+			/*
+			 * Close PIPEs used for communicating with the
+			 * decompression daemon. The daemon reads EOF and
+			 * exits. Wait for it to finish so it does not become
+			 * a zombie.
+			 */
+			sys_close(args->page_pipe_fd_r);
+			sys_close(args->page_pipe_fd_w);
+
+			if (args->decompress_daemon_pid > 0) {
+				int status = 0;
+				long wret;
+
+				wret = sys_wait4(args->decompress_daemon_pid,
+						 &status, 0, NULL);
+				if (wret == -ECHILD) {
+					/* Already reaped by sigchld_handler */
+				} else if (wret < 0) {
+					pr_err("Failed to wait for decompress daemon %d (%d)\n",
+					       args->decompress_daemon_pid,
+					       (int)wret);
+					goto core_restore_end;
+				} else if (!WIFEXITED(status) ||
+					   WEXITSTATUS(status)) {
+					pr_err("Decompress daemon %d failed (%d,%d)\n",
+					       args->decompress_daemon_pid,
+					       WEXITSTATUS(status),
+					       WTERMSIG(status));
+					goto core_restore_end;
+				}
+			}
+
+			if (args->vma_ios_fd != -1)
+				sys_close(args->vma_ios_fd);
+		} else {
+			int rc = args->vma_ios_use_direct
+				? restore_vma_aio(args)
+				: restore_vma_preadv(args);
+			if (rc < 0)
+				goto core_restore_end;
+		}
 	}
 
 	/*

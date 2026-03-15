@@ -52,6 +52,22 @@ uuid = uuid.uuid4()
 NON_ROOT_UID = 65534
 
 
+def parse_size_str(s):
+    """Parse a SIZE string with optional K/M/G suffix into bytes,
+    matching parse_size() in criu/config.c."""
+    s = str(s).strip()
+    if not s:
+        raise ValueError("empty size string")
+    mult = 1
+    if s[-1] in ('K', 'k'):
+        mult, s = 1024, s[:-1]
+    elif s[-1] in ('M', 'm'):
+        mult, s = 1024 * 1024, s[:-1]
+    elif s[-1] in ('G', 'g'):
+        mult, s = 1024 * 1024 * 1024, s[:-1]
+    return int(s) * mult
+
+
 def alarm(*args):
     print("==== ALARM ====")
 
@@ -1042,6 +1058,22 @@ class criu_rpc:
                 criu.opts.pidfd_store_sk = criu_rpc.pidfd_store_socket.fileno()
             elif "--mntns-compat-mode" == arg:
                 criu.opts.mntns_compat_mode = True
+            elif arg in ("-c", "--compress"):
+                criu.opts.compress = 1  # COMPRESS_PER_PAGE
+            elif "--compress-acceleration" == arg:
+                criu.opts.compress_acceleration = int(args.pop(0))
+                if criu.opts.compress == 0:
+                    criu.opts.compress = 1
+            elif arg == "--compress-region" or \
+                    arg.startswith("--compress-region="):
+                # Accept K/M/G suffixes and both '--compress-region SIZE'
+                # and '--compress-region=SIZE' forms.
+                if "=" in arg:
+                    val = arg.split("=", 1)[1]
+                else:
+                    val = args.pop(0)
+                criu.opts.compress_region_size = parse_size_str(val)
+                criu.opts.compress = 2  # COMPRESS_REGION
             else:
                 raise test_fail_exc('RPC for %s(%s) required' % (arg, args.pop(0)))
 
@@ -1165,6 +1197,9 @@ class criu:
         self.__pre_dump_mode = opts['pre_dump_mode']
         self.__preload_libfault = bool(opts['preload_libfault'])
         self.__mntns_compat_mode = bool(opts['mntns_compat_mode'])
+        self.__compress = bool(opts['compress'])
+        self.__compress_acceleration = opts.get('compress_acceleration', 0)
+        self.__compress_region = opts.get('compress_region', None)
         self.__cuda_checkpoint = bool(opts['mocked_cuda_checkpoint'])
 
         if opts['rpc']:
@@ -1382,7 +1417,26 @@ class criu:
 
         r_pages = real_written / mmap.PAGESIZE
         r_off = real_written % mmap.PAGESIZE
-        if (stats_written != r_pages) or (r_off != 0):
+        # Detect compression: from CLI (--compress / --compress-region)
+        # or from the test's dump options when -c / --compress /
+        # --compress-region is in .desc opts.
+        compress = self.__compress or bool(self.__compress_region)
+        if not compress and self.__test is not None:
+            dopts = self.__test.getdopts()
+            compress = ('-c' in dopts or
+                        any(a == '--compress' or
+                            a.startswith('--compress-region')
+                            for a in dopts))
+        if compress:
+            # With compression, the pages file size differs from
+            # stats_written * PAGE_SIZE. LZ4 worst case per page is
+            # PAGE_SIZE + PAGE_SIZE/255 + 16, so allow that bound.
+            max_compressed = stats_written * (mmap.PAGESIZE + mmap.PAGESIZE // 255 + 16)
+            if real_written > max_compressed:
+                print("ERROR: compressed pages too large (stats = %d, real = %d, bound = %d)" %
+                      (stats_written, real_written, max_compressed))
+                raise test_fail_exc("page counts mismatch")
+        elif (stats_written != r_pages) or (r_off != 0):
             print("ERROR: bad page counts, stats = %d real = %d(%d)" %
                   (stats_written, r_pages, r_off))
             raise test_fail_exc("page counts mismatch")
@@ -1469,6 +1523,12 @@ class criu:
             ps_opts = ["--port", "12345"] + self.__tls
             if self.__dedup:
                 ps_opts += ["--auto-dedup"]
+            if self.__compress:
+                ps_opts += ["-c"]
+            if self.__compress_region:
+                ps_opts += ["--compress-region", str(self.__compress_region)]
+            if self.__compress_acceleration:
+                ps_opts += ["--compress-acceleration", "%d" % self.__compress_acceleration]
 
             self.__page_server_p = self.__criu_act("page-server",
                                                    opts=ps_opts,
@@ -1499,6 +1559,12 @@ class criu:
             a_opts += ['--empty-ns', 'net']
         if self.__pre_dump_mode:
             a_opts += ["--pre-dump-mode", "%s" % self.__pre_dump_mode]
+        if self.__compress:
+            a_opts += ["-c"]
+        if self.__compress_region:
+            a_opts += ["--compress-region", str(self.__compress_region)]
+        if self.__compress_acceleration:
+            a_opts += ["--compress-acceleration", "%d" % self.__compress_acceleration]
 
         nowait = False
         if self.__lazy_migrate and action == "dump":
@@ -2186,6 +2252,7 @@ class Launcher:
               'remote_lazy_pages', 'show_stats', 'lazy_migrate', 'stream',
               'tls', 'criu_bin', 'crit_bin', 'pre_dump_mode', 'mntns_compat_mode',
               'rootless', 'preload_libfault', 'mocked_cuda_checkpoint',
+              'compress', 'compress_acceleration', 'compress_region',
               'pycriu_search_path')
         arg = repr((name, desc, flavor, {d: self.__opts[d] for d in nd}))
 
@@ -2893,6 +2960,16 @@ def get_cli_args():
                     choices=['amdgpu', 'cuda', 'inventory_test_enabled', 'inventory_test_disabled'],
                     nargs='+',
                     default=None)
+    rp.add_argument("--compress",
+                    help="Enable LZ4 per-page compression of memory pages",
+                    action='store_true')
+    rp.add_argument("--compress-region",
+                    help="Enable LZ4 region compression with the given region "
+                         "size (K/M/G suffix accepted, e.g. 256K, 1M)",
+                    default=None)
+    rp.add_argument("--compress-acceleration",
+                    help="LZ4 acceleration (1=default, higher=faster)",
+                    type=int, default=0)
     rp.add_argument("--mocked-cuda-checkpoint",
                     action="store_true",
                     help="Run criu with the cuda plugin and the mocked cuda-checkpoint tool")

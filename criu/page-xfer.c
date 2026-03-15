@@ -27,6 +27,7 @@
 #include "rst_info.h"
 #include "stats.h"
 #include "tls.h"
+#include "compression.h"
 
 static int page_server_sk = -1;
 
@@ -50,6 +51,7 @@ static void psi2iovec(struct page_server_iov *ps, struct iovec *iov)
 #define PS_IOV_PARENT 5
 #define PS_IOV_ADD_F  6
 #define PS_IOV_GET    7
+#define PS_IOV_ADD_F_COMPRESSED 8
 
 #define PS_IOV_CLOSE	   0x1023
 #define PS_IOV_FORCE_CLOSE 0x1024
@@ -172,6 +174,8 @@ static void tcp_nodelay(int sk, bool on)
 		pr_pwarn("Unable to set TCP_NODELAY=%d", val);
 }
 
+static int write_fd_full(int fd, const void *buf, size_t size);
+
 /* page-server xfer */
 static int write_pages_to_server(struct page_xfer *xfer, int p, unsigned long len)
 {
@@ -200,10 +204,80 @@ static int write_pages_to_server(struct page_xfer *xfer, int p, unsigned long le
 	return 0;
 }
 
+/*
+ * Compress pages and send them over the network. For each page,
+ * send a uint32_t compressed size followed by the compressed data.
+ * Zero pages send compressed_size=0 with no data. This avoids
+ * transferring full uncompressed pages over the network.
+ */
+static int write_pages_to_server_compressed(struct page_xfer *xfer, int p, unsigned long len)
+{
+	char buf[PAGE_SIZE], compressed_buf[PAGE_COMPRESSED_SIZE_BOUND];
+	unsigned long off = 0;
+	int acceleration;
+
+	if (opts.compress_acceleration)
+		acceleration = opts.compress_acceleration;
+	else
+		acceleration = LZ4_DEFAULT_ACCELERATION;
+
+	while (off < len) {
+		ssize_t ret;
+		ssize_t cur = 0;
+		uint32_t compressed_size;
+
+		while (cur < PAGE_SIZE) {
+			ret = read(p, buf + cur, PAGE_SIZE - cur);
+			if (ret < 0) {
+				pr_perror("Unable to read page data");
+				return -1;
+			}
+			if (ret == 0) {
+				pr_err("Pipe closed unexpectedly\n");
+				return -1;
+			}
+			cur += ret;
+		}
+		off += PAGE_SIZE;
+
+		if (page_is_all_zero(buf)) {
+			compressed_size = 0;
+		} else {
+			int r = compress_data(buf, PAGE_SIZE, compressed_buf,
+					      PAGE_COMPRESSED_SIZE_BOUND,
+					      acceleration);
+			if (r < 0)
+				return -1;
+			compressed_size = (r >= PAGE_COMPRESSION_THRESHOLD) ? PAGE_SIZE : r;
+		}
+
+		/* Send compressed size */
+		if (write_fd_full(xfer->sk, &compressed_size, sizeof(compressed_size)))
+			return -1;
+
+		/* Send page data (compressed, raw, or nothing for zero) */
+		if (compressed_size == 0) {
+			/* Zero page, nothing to send */
+		} else if (compressed_size == PAGE_SIZE) {
+			/* Raw page: incompressible, send the original PAGE_SIZE bytes */
+			if (write_fd_full(xfer->sk, buf, PAGE_SIZE))
+				return -1;
+		} else {
+			/* Compressed page: send the compressed_size-byte LZ4 block */
+			if (write_fd_full(xfer->sk, compressed_buf, compressed_size))
+				return -1;
+		}
+	}
+
+	return 0;
+}
+
 static int write_pagemap_to_server(struct page_xfer *xfer, struct iovec *iov, u32 flags)
 {
 	struct page_server_iov pi = {
-		.cmd = encode_ps_cmd(PS_IOV_ADD_F, flags),
+		.cmd = encode_ps_cmd(opts.compress_mode ?
+				     PS_IOV_ADD_F_COMPRESSED : PS_IOV_ADD_F,
+				     flags),
 		.nr_pages = iov->iov_len / PAGE_SIZE,
 		.vaddr = encode_pointer(iov->iov_base),
 		.dst_id = xfer->dst_id,
@@ -226,7 +300,8 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 
 	xfer->sk = page_server_sk;
 	xfer->write_pagemap = write_pagemap_to_server;
-	xfer->write_pages = write_pages_to_server;
+	xfer->write_pages = opts.compress_mode ?
+		write_pages_to_server_compressed : write_pages_to_server;
 	xfer->close = close_server_xfer;
 	xfer->dst_id = encode_pm(fd_type, img_id);
 	xfer->parent = NULL;
@@ -252,6 +327,288 @@ static int open_page_server_xfer(struct page_xfer *xfer, int fd_type, unsigned l
 }
 
 /* local xfer */
+static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov);
+
+static int write_pagemap_loc_compressed(struct page_xfer *xfer, struct iovec *iov, u32 flags)
+{
+	int ret;
+
+	if (flags & PE_PRESENT) {
+		unsigned long nr_pages;
+		unsigned int region_pages = 0;
+		size_t total_blocks;
+
+		if (opts.auto_dedup && xfer->parent != NULL) {
+			ret = dedup_one_iovec(xfer->parent,
+					      encode_pointer(iov->iov_base),
+					      iov->iov_len);
+			if (ret == -1) {
+				pr_perror("Auto-deduplication failed");
+				return ret;
+			}
+		}
+
+		nr_pages = iov->iov_len / PAGE_SIZE;
+		if (opts.compress_mode == COMPRESS_REGION) {
+			region_pages = opts.compress_region_size / PAGE_SIZE;
+			if (region_pages == 0 || region_pages > MAX_REGION_PAGES) {
+				pr_err("Invalid region_pages %u\n", region_pages);
+				return -1;
+			}
+			total_blocks = (nr_pages + region_pages - 1) / region_pages;
+		} else {
+			total_blocks = nr_pages;
+		}
+
+		/*
+		 * Guard the compressed_size[] allocation against a size_t
+		 * overflow in the byte-size computation. Check the count
+		 * against SIZE_MAX / elemsize rather than multiplying first,
+		 * so the test is correct on both ILP32 and LP64. total_blocks
+		 * is bounded by nr_pages, so guarding nr_pages covers it.
+		 */
+		if (nr_pages > SIZE_MAX / sizeof(uint32_t)) {
+			pr_err("Pagemap entry too large for compression: %lu pages\n",
+			       nr_pages);
+			return -1;
+		}
+
+		/* Buffer the entry; write_pages will flush it. */
+		xfer->pending_pe.vaddr = encode_pointer(iov->iov_base);
+		xfer->pending_pe.nr_pages = nr_pages;
+		xfer->pending_pe.flags = flags;
+		xfer->pending_pe.region_pages = region_pages;
+		xfer->pending_pe.total_blocks = total_blocks;
+		xfer->pending_pe.compressed_size = xzalloc(total_blocks * sizeof(uint32_t));
+		if (!xfer->pending_pe.compressed_size)
+			return -1;
+		xfer->pending_pe.n_compressed = 0;
+		xfer->pending_pe.total_compressed_size = 0;
+		return 0;
+	}
+
+	/* Non-present pages (holes, parent refs): write immediately */
+	if (flags & PE_PARENT) {
+		if (xfer->parent != NULL) {
+			ret = check_pagehole_in_parent(xfer->parent, iov);
+			if (ret) {
+				pr_err("Hole %p - %p not found in parent\n",
+				       iov->iov_base, iov->iov_base + iov->iov_len);
+				return -1;
+			}
+		}
+	}
+
+	{
+		PagemapEntry pe = PAGEMAP_ENTRY__INIT;
+
+		pe.vaddr = encode_pointer(iov->iov_base);
+		pe.nr_pages = iov->iov_len / PAGE_SIZE;
+		pe.has_flags = true;
+		pe.flags = flags;
+		pe.has_nr_pages = true;
+
+		if (pb_write_one(xfer->pmi, &pe, PB_PAGEMAP) < 0)
+			return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * Write exactly @size bytes to @fd, handling short writes and EINTR.
+ */
+static int write_fd_full(int fd, const void *buf, size_t size)
+{
+	size_t done = 0;
+
+	while (done < size) {
+		ssize_t ret = write(fd, (const char *)buf + done, size - done);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			pr_perror("Unable to write image data");
+			return -1;
+		}
+		done += ret;
+	}
+	return 0;
+}
+
+/*
+ * Read exactly @count bytes from @fd into @buf, looping over short reads.
+ */
+static int read_pipe_full(int fd, void *buf, size_t count)
+{
+	size_t done = 0;
+
+	while (done < count) {
+		ssize_t ret = read(fd, (char *)buf + done, count - done);
+
+		if (ret < 0) {
+			pr_perror("Unable to read page data");
+			return -1;
+		}
+		if (ret == 0) {
+			pr_err("A pipe was closed unexpectedly\n");
+			return -1;
+		}
+		done += ret;
+	}
+	return 0;
+}
+
+static int write_pages_loc_compressed(struct page_xfer *xfer, int p, unsigned long len)
+{
+	int fd = img_raw_fd(xfer->pi);
+	unsigned long off = 0;
+	int acceleration;
+	unsigned int region_pages = xfer->pending_pe.region_pages;
+
+	if (len / PAGE_SIZE > xfer->pending_pe.nr_pages) {
+		pr_err("write_pages len %lu exceeds pending pagemap (%lu pages)\n",
+		       len, xfer->pending_pe.nr_pages);
+		return -1;
+	}
+
+	/*
+	 * LZ4 acceleration controls the speed/ratio tradeoff.
+	 * Value 1 probes the most hash table positions, giving
+	 * the best ratio. Higher values skip more candidates
+	 * for faster but less thorough compression.
+	 */
+	if (opts.compress_acceleration)
+		acceleration = opts.compress_acceleration;
+	else
+		acceleration = LZ4_DEFAULT_ACCELERATION;
+
+	if (region_pages == 0) {
+		/* Per-page mode: keep the original tight stack-buffered loop. */
+		char buf[PAGE_SIZE], compressed_buf[PAGE_COMPRESSED_SIZE_BOUND];
+
+		while (off < len) {
+			int cs;
+			size_t idx;
+
+			if (read_pipe_full(p, buf, PAGE_SIZE))
+				return -1;
+			off += PAGE_SIZE;
+
+			idx = xfer->pending_pe.n_compressed++;
+
+			if (page_is_all_zero(buf)) {
+				xfer->pending_pe.compressed_size[idx] = 0;
+				continue;
+			}
+
+			cs = compress_data(buf, PAGE_SIZE, compressed_buf,
+					   PAGE_COMPRESSED_SIZE_BOUND, acceleration);
+			if (cs < 0)
+				return -1;
+
+			if (cs >= PAGE_COMPRESSION_THRESHOLD) {
+				xfer->pending_pe.compressed_size[idx] = PAGE_SIZE;
+				xfer->pending_pe.total_compressed_size += PAGE_SIZE;
+				if (write_fd_full(fd, buf, PAGE_SIZE))
+					return -1;
+			} else {
+				xfer->pending_pe.compressed_size[idx] = cs;
+				xfer->pending_pe.total_compressed_size += cs;
+				if (write_fd_full(fd, compressed_buf, cs))
+					return -1;
+			}
+		}
+	} else {
+		/*
+		 * Region mode: accumulate region_pages worth of data and
+		 * compress as one LZ4 block. The last region may be short
+		 * if nr_pages % region_pages != 0.
+		 */
+		size_t region_bytes_max = (size_t)region_pages * PAGE_SIZE;
+		size_t cap = REGION_COMPRESSED_SIZE_BOUND(region_pages);
+		unsigned long pages_done;
+		char *src_buf, *dst_buf;
+		int rc = -1;
+
+		src_buf = xmalloc(region_bytes_max);
+		dst_buf = xmalloc(cap);
+		if (!src_buf || !dst_buf)
+			goto region_out;
+
+		pages_done = (unsigned long)xfer->pending_pe.n_compressed *
+			     region_pages;
+
+		while (off < len) {
+			unsigned long pages_left =
+				xfer->pending_pe.nr_pages - pages_done;
+			unsigned int this_region =
+				pages_left < region_pages ? pages_left :
+							    region_pages;
+			size_t region_bytes = (size_t)this_region * PAGE_SIZE;
+			int cs;
+			size_t idx;
+
+			if (off + region_bytes > len) {
+				pr_err("write_pages len mismatch in region mode\n");
+				goto region_out;
+			}
+
+			if (read_pipe_full(p, src_buf, region_bytes))
+				goto region_out;
+			off += region_bytes;
+			pages_done += this_region;
+
+			idx = xfer->pending_pe.n_compressed++;
+
+			cs = compress_region(src_buf, this_region, dst_buf,
+					     cap, acceleration);
+			if (cs < 0)
+				goto region_out;
+
+			xfer->pending_pe.compressed_size[idx] = cs;
+			xfer->pending_pe.total_compressed_size += cs;
+			if (cs > 0 && write_fd_full(fd, dst_buf, cs))
+				goto region_out;
+		}
+
+		rc = 0;
+region_out:
+		xfree(src_buf);
+		xfree(dst_buf);
+		if (rc < 0)
+			return -1;
+	}
+
+	/* When all blocks are compressed, flush the pagemap entry */
+	if (xfer->pending_pe.n_compressed == xfer->pending_pe.total_blocks) {
+		PagemapEntry pe = PAGEMAP_ENTRY__INIT;
+
+		pe.vaddr = xfer->pending_pe.vaddr;
+		pe.nr_pages = xfer->pending_pe.nr_pages;
+		pe.has_flags = true;
+		pe.flags = xfer->pending_pe.flags;
+		pe.has_nr_pages = true;
+		pe.compressed_size = xfer->pending_pe.compressed_size;
+		pe.n_compressed_size = xfer->pending_pe.total_blocks;
+		pe.has_total_compressed_size = true;
+		pe.total_compressed_size = xfer->pending_pe.total_compressed_size;
+
+		if (region_pages > 0) {
+			pe.has_region_pages = true;
+			pe.region_pages = region_pages;
+		}
+
+		if (pb_write_one(xfer->pmi, &pe, PB_PAGEMAP) < 0)
+			return -1;
+
+		xfree(xfer->pending_pe.compressed_size);
+		xfer->pending_pe.compressed_size = NULL;
+	}
+
+	return 0;
+}
+
 static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 {
 	ssize_t ret;
@@ -361,6 +718,8 @@ static void close_page_xfer(struct page_xfer *xfer)
 		xfree(xfer->parent);
 		xfer->parent = NULL;
 	}
+	xfree(xfer->pending_pe.compressed_size);
+	xfer->pending_pe.compressed_size = NULL;
 	close_image(xfer->pi);
 	close_image(xfer->pmi);
 }
@@ -417,8 +776,14 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	}
 
 out:
-	xfer->write_pagemap = write_pagemap_loc;
-	xfer->write_pages = write_pages_loc;
+	xfer->pending_pe.compressed_size = NULL;
+	if (opts.compress_mode) {
+		xfer->write_pagemap = write_pagemap_loc_compressed;
+		xfer->write_pages = write_pages_loc_compressed;
+	} else {
+		xfer->write_pagemap = write_pagemap_loc;
+		xfer->write_pages = write_pages_loc;
+	}
 	xfer->close = close_page_xfer;
 	return 0;
 
@@ -1067,6 +1432,118 @@ static int prep_loc_xfer(struct page_server_iov *pi)
 		return 0;
 }
 
+/*
+ * Receive pre-compressed pages from the network. The client sends
+ * a uint32_t compressed_size followed by compressed_size bytes of
+ * data for each page. Zero pages have compressed_size=0 with no
+ * data. Pages stored raw have compressed_size=PAGE_SIZE.
+ *
+ * We write them directly to the local image without re-compressing.
+ */
+static int page_server_add_compressed(int sk, struct page_server_iov *pi, u32 flags)
+{
+	struct page_xfer *lxfer = &cxfer.loc_xfer;
+	struct iovec iov;
+	int fd;
+	unsigned long i;
+	uint32_t *compressed_size;
+	uint64_t total_compressed_size = 0;
+
+	pr_debug("Adding compressed %" PRIx64 " - %" PRIx64 "\n",
+		 pi->vaddr, pi->vaddr + pi->nr_pages * PAGE_SIZE);
+
+	if (prep_loc_xfer(pi))
+		return -1;
+
+	psi2iovec(pi, &iov);
+
+	if (!(flags & PE_PRESENT)) {
+		/* Non-present pages: write pagemap immediately */
+		if (lxfer->write_pagemap(lxfer, &iov, flags))
+			return -1;
+		return 0;
+	}
+
+	fd = img_raw_fd(lxfer->pi);
+
+	/*
+	 * pi->nr_pages comes from the network and is untrusted. Check the
+	 * count against SIZE_MAX / elemsize rather than multiplying first:
+	 * a multiply could itself overflow uint64_t and slip past the guard,
+	 * leaving compressed_size[] undersized for the loop below.
+	 */
+	if (pi->nr_pages > SIZE_MAX / sizeof(uint32_t)) {
+		pr_err("Too many pages for compression: %" PRIu64 "\n",
+		       pi->nr_pages);
+		return -1;
+	}
+
+	compressed_size = xmalloc(pi->nr_pages * sizeof(uint32_t));
+	if (!compressed_size)
+		return -1;
+
+	/* Receive per-page compressed data from the network */
+	for (i = 0; i < pi->nr_pages; i++) {
+		uint32_t cs;
+		ssize_t ret;
+
+		ret = __recv(sk, &cs, sizeof(cs), MSG_WAITALL);
+		if (ret != sizeof(cs)) {
+			pr_perror("Can't read compressed size");
+			xfree(compressed_size);
+			return -1;
+		}
+
+		if (cs > PAGE_COMPRESSED_SIZE_BOUND) {
+			pr_err("Invalid compressed size %u from network\n", cs);
+			xfree(compressed_size);
+			return -1;
+		}
+
+		compressed_size[i] = cs;
+		total_compressed_size += cs;
+
+		if (cs > 0) {
+			char buf[PAGE_COMPRESSED_SIZE_BOUND];
+
+			ret = __recv(sk, buf, cs, MSG_WAITALL);
+			if (ret != cs) {
+				pr_perror("Can't read compressed data");
+				xfree(compressed_size);
+				return -1;
+			}
+
+			if (write_fd_full(fd, buf, cs)) {
+				xfree(compressed_size);
+				return -1;
+			}
+		}
+	}
+
+	/* Write pagemap entry with compression metadata */
+	{
+		PagemapEntry pe = PAGEMAP_ENTRY__INIT;
+
+		pe.vaddr = encode_pointer(iov.iov_base);
+		pe.nr_pages = pi->nr_pages;
+		pe.has_flags = true;
+		pe.flags = flags;
+		pe.has_nr_pages = true;
+		pe.compressed_size = compressed_size;
+		pe.n_compressed_size = pi->nr_pages;
+		pe.has_total_compressed_size = true;
+		pe.total_compressed_size = total_compressed_size;
+
+		if (pb_write_one(lxfer->pmi, &pe, PB_PAGEMAP) < 0) {
+			xfree(compressed_size);
+			return -1;
+		}
+	}
+
+	xfree(compressed_size);
+	return 0;
+}
+
 static int page_server_add(int sk, struct page_server_iov *pi, u32 flags)
 {
 	size_t len;
@@ -1238,6 +1715,12 @@ static int page_server_serve(int sk)
 		case PS_IOV_PARENT:
 			ret = page_server_check_parent(sk, &pi);
 			break;
+		case PS_IOV_ADD_F_COMPRESSED: {
+			u32 flags = decode_ps_flags(pi.cmd);
+
+			ret = page_server_add_compressed(sk, &pi, flags);
+			break;
+		}
 		case PS_IOV_ADD_F:
 		case PS_IOV_ADD:
 		case PS_IOV_HOLE: {

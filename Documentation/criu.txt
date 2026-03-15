@@ -378,6 +378,37 @@ mount -t cgroup -o devices,freezer none devices,freezer
     Allows to link unlinked files back, if possible (modifies filesystem
     during *restore*).
 
+*-c, --compress*::
+    Enable LZ4 per-page compression of memory pages during *dump*.
+    Each 4 KiB page is compressed as an independent LZ4 block.
+    Zero-filled pages are detected and stored with no data; pages that
+    do not compress well are stored raw to avoid decompression overhead
+    on *restore*. The compression choice made at *dump* time is recorded
+    in the inventory image and applied automatically on *restore*.
+    Compatible with *--page-server*, *--stream*, *--lazy-pages*,
+    iterative checkpointing, *--auto-dedup*, and the *dedup* command.
+
+*--compress-region* 'size'::
+    Enable LZ4 region compression of memory pages during *dump*.
+    A run of consecutive pages totalling 'size' bytes is compressed as
+    a single LZ4 block, which yields a better ratio and faster dump
+    on heap-shaped data than per-page compression at the cost of
+    slightly slower restore on partial reads. 'size' accepts K/M/G
+    suffixes (e.g. *256K*, *1M*); it must be a multiple of 4096 and
+    at most 4M (1024 pages). Mutually exclusive with *--compress*.
+    Currently supports only the local image path (no
+    *--page-server* / *--stream*). Hole-punching deduplication is
+    skipped for compressed images since compressed pages are
+    variably-sized.
+
+*--compress-acceleration* 'N'::
+    Set the LZ4 acceleration level for page compression (1 to 65537).
+    Controls how thoroughly the compressor searches for matching byte
+    sequences. The default value of 1 gives the best compression
+    ratio. Higher values skip more match candidates, resulting in
+    faster compression but larger output. Decompression speed is not
+    affected. Implies *--compress* unless *--compress-region* is set.
+
 *--timeout* 'number'::
     Set a time limit in seconds for collecting tasks during the
     dump operation. The timeout is 10 seconds by default.

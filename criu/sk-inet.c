@@ -188,6 +188,12 @@ static int can_dump_inet_sk(const struct inet_sk_desc *sk)
 			       SK_INFLIGHT_PARAM);
 			return 0;
 		}
+
+		if (tcp_sk_desc_has_unsafe_loopback_only_listener(sk)) {
+			pr_err("Non-loopback TCP listener %x is not allowed with --%s.\n", sk->sd.ino,
+			       SK_LOOPBACK_ONLY_PARAM);
+			return 0;
+		}
 		break;
 	case TCP_ESTABLISHED:
 	case TCP_FIN_WAIT2:
@@ -196,8 +202,9 @@ static int can_dump_inet_sk(const struct inet_sk_desc *sk)
 	case TCP_LAST_ACK:
 	case TCP_CLOSING:
 	case TCP_SYN_SENT:
-		if (!opts.tcp_established_ok && !opts.tcp_close) {
-			pr_err("Connected TCP socket, consider using --%s option.\n", SK_EST_PARAM);
+		if (!opts.tcp_established_ok && !opts.tcp_close && !opts.tcp_loopback_only) {
+			pr_err("Connected TCP socket, consider using --%s or --%s.\n", SK_EST_PARAM,
+			       SK_LOOPBACK_ONLY_PARAM);
 			return 0;
 		}
 		break;
@@ -709,7 +716,8 @@ static int collect_one_inetsk(void *o, ProtobufCMessage *base, struct cr_img *i)
 	struct inet_sk_info *ii = o;
 
 	ii->ie = pb_msg(base, InetSkEntry);
-	if (tcp_connection(ii->ie))
+	ii->restore_as_closed = tcp_sk_entry_needs_loopback_only_close(ii->ie);
+	if (tcp_connection(ii->ie) && !ii->restore_as_closed)
 		tcp_locked_conn_add(ii);
 
 	/*
@@ -772,6 +780,9 @@ static int post_open_inet_sk(struct file_desc *d, int sk)
 	 * after unlocking connections.
 	 */
 	if (tcp_connection(ii->ie)) {
+		if (ii->restore_as_closed)
+			return 0;
+
 		pr_debug("Schedule %d socket for repair off\n", sk);
 		BUG_ON(ii->sk_fd != -1);
 		ii->sk_fd = sk;
@@ -908,7 +919,7 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 		goto err;
 
 	if (tcp_connection(ie)) {
-		if (!opts.tcp_established_ok && !opts.tcp_close) {
+		if (!opts.tcp_established_ok && !opts.tcp_close && !opts.tcp_loopback_only) {
 			pr_err("Connected TCP socket in image\n");
 			goto err;
 		}

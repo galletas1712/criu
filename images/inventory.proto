@@ -34,4 +34,5 @@ message inventory_entry {
 	// network locking rule.
 	optional string                 dump_criu_run_id        = 13;
 	optional bool			allow_uprobes	= 14;
+	optional bool			tcp_loopback_only = 15;
 }

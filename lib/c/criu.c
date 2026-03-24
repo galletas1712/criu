@@ -522,6 +522,17 @@ void criu_set_tcp_close(bool tcp_close)
 	criu_local_set_tcp_close(global_opts, tcp_close);
 }
 
+void criu_local_set_tcp_loopback_only(criu_opts *opts, bool tcp_loopback_only)
+{
+	opts->rpc->has_tcp_loopback_only = true;
+	opts->rpc->tcp_loopback_only = tcp_loopback_only;
+}
+
+void criu_set_tcp_loopback_only(bool tcp_loopback_only)
+{
+	criu_local_set_tcp_loopback_only(global_opts, tcp_loopback_only);
+}
+
 void criu_local_set_weak_sysctls(criu_opts *opts, bool val)
 {
 	opts->rpc->has_weak_sysctls = true;

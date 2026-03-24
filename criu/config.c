@@ -684,6 +684,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd, 
 		BOOL_OPT("weak-sysctls", &opts.weak_sysctls),
 		{ "status-fd", required_argument, 0, 1088 },
 		BOOL_OPT(SK_CLOSE_PARAM, &opts.tcp_close),
+		BOOL_OPT(SK_LOOPBACK_ONLY_PARAM, &opts.tcp_loopback_only),
 		{ "verbosity", optional_argument, 0, 'v' },
 		{ "ps-socket", required_argument, 0, 1091 },
 		BOOL_OPT("stream", &opts.stream),
@@ -1075,12 +1076,24 @@ bad_arg:
 
 int check_options(void)
 {
+	if (opts.tcp_loopback_only && opts.tcp_established_ok) {
+		pr_err("--%s and --%s are mutually exclusive\n", SK_LOOPBACK_ONLY_PARAM, SK_EST_PARAM);
+		return 1;
+	}
+
+	if (opts.tcp_loopback_only && opts.tcp_close) {
+		pr_err("--%s and --%s are mutually exclusive\n", SK_LOOPBACK_ONLY_PARAM, SK_CLOSE_PARAM);
+		return 1;
+	}
+
 	if (opts.tcp_established_ok)
 		pr_info("Will dump/restore TCP connections\n");
 	if (opts.tcp_skip_in_flight)
 		pr_info("Will skip in-flight TCP connections\n");
 	if (opts.tcp_close)
 		pr_info("Will drop all TCP connections on restore\n");
+	if (opts.tcp_loopback_only)
+		pr_info("Will preserve loopback TCP connections and restore non-loopback TCP sockets as closed\n");
 	if (opts.link_remap_ok)
 		pr_info("Will allow link remaps on FS\n");
 	if (opts.weak_sysctls)

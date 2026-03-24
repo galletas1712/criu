@@ -101,6 +101,9 @@ TST_NOFILE	:=				\
 		socket-tcp-nft-nfconntrack	\
 		socket-tcp6-local		\
 		socket-tcp4v6-local		\
+		socket-tcp-loopback-only	\
+		socket-tcp-loopback-only-close	\
+		socket-tcp-loopback-only-listen	\
 		socket-tcpbuf			\
 		socket-tcpbuf-local		\
 		socket-tcpbuf6-local		\

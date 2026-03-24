@@ -87,6 +87,8 @@ enum NETWORK_LOCK_METHOD {
 
 #define DEFAULT_TIMEOUT 10
 
+#define SK_LOOPBACK_ONLY_PARAM "tcp-loopback-only"
+
 enum FILE_VALIDATION_OPTIONS {
 	/*
 	 * This constant indicates that the file validation should be tried with the
@@ -145,6 +147,7 @@ struct cr_options {
 	int handle_file_locks;
 	int tcp_established_ok;
 	int tcp_close;
+	int tcp_loopback_only;
 	int evasive_devices;
 	int link_remap_ok;
 	int log_file_per_pid;

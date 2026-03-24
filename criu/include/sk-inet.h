@@ -58,9 +58,10 @@ struct inet_sk_info {
 	/*
 	 * This is an fd by which the socket is opened.
 	 * It will be carried down to restorer code to
-	 * repair-off the socket at the very end.
+ * repair-off the socket at the very end.
 	 */
 	int sk_fd;
+	bool restore_as_closed;
 	struct list_head rlist;
 };
 
@@ -86,6 +87,9 @@ extern void cpt_unlock_tcp_connections(void);
 
 extern int dump_one_tcp(int sk, struct inet_sk_desc *sd, SkOptsEntry *soe);
 extern int restore_one_tcp(int sk, struct inet_sk_info *si);
+extern bool tcp_sk_desc_needs_loopback_only_close(const struct inet_sk_desc *sk);
+extern bool tcp_sk_desc_has_unsafe_loopback_only_listener(const struct inet_sk_desc *sk);
+extern bool tcp_sk_entry_needs_loopback_only_close(const InetSkEntry *ie);
 
 extern int dump_tcp_opts(int sk, TcpOptsEntry *toe);
 extern int restore_tcp_opts(int sk, TcpOptsEntry *toe);

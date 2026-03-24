@@ -485,6 +485,9 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (req->has_tcp_close)
 		opts.tcp_close = req->tcp_close;
 
+	if (req->has_tcp_loopback_only)
+		opts.tcp_loopback_only = req->tcp_loopback_only;
+
 	if (req->has_weak_sysctls)
 		opts.weak_sysctls = req->weak_sysctls;
 

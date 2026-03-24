@@ -95,6 +95,11 @@ int check_img_inventory(bool restore)
 		goto out_err;
 	}
 
+	if (restore && he->tcp_loopback_only && !opts.tcp_loopback_only) {
+		pr_err("Dumped with --tcp-loopback-only. Need to set it on restore as well.\n");
+		goto out_err;
+	}
+
 	if (restore && he->allow_uprobes && !opts.allow_uprobes) {
 		pr_err("Dumped with --" OPT_ALLOW_UPROBES ". Need to set it on restore as well.\n");
 		goto out_err;
@@ -385,6 +390,11 @@ int prepare_inventory(InventoryEntry *he)
 	if (opts.tcp_close) {
 		he->tcp_close = true;
 		he->has_tcp_close = true;
+	}
+
+	if (opts.tcp_loopback_only) {
+		he->tcp_loopback_only = true;
+		he->has_tcp_loopback_only = true;
 	}
 
 	/* Save network lock method to reuse in restore */

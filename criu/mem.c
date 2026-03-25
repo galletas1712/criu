@@ -39,6 +39,12 @@
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
 
+/*
+ * Batch inherited COW page reads so compact restore can amortize indexed
+ * lookup and preadv overhead.
+ */
+#define COW_COMPARE_BATCH_PAGES 256
+
 static int task_reset_dirty_track(int pid)
 {
 	int ret;
@@ -1125,6 +1131,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	int ret = 0;
 	struct list_head *vmas = &rsti(t)->vmas.h;
 	struct list_head *vma_io = &rsti(t)->vma_io;
+	unsigned char *cow_buf = xmalloc(COW_COMPARE_BATCH_PAGES * PAGE_SIZE);
 
 	unsigned int nr_restored = 0;
 	unsigned int nr_shared = 0;
@@ -1132,8 +1139,14 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	unsigned int nr_compared = 0;
 	unsigned int nr_enqueued = 0;
 	unsigned int nr_lazy = 0;
+	unsigned int nr_cow_batches = 0;
 	unsigned long va;
+	struct timeval cow_tv0, cow_tv1;
 
+	if (!cow_buf)
+		return -1;
+
+	gettimeofday(&cow_tv0, NULL);
 	vma = list_first_entry(vmas, struct vma_area, list);
 	rsti(t)->pages_img_id = pr->pages_img_id;
 
@@ -1162,7 +1175,6 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 		}
 
 		for (i = 0; i < nr_pages; i++) {
-			unsigned char buf[PAGE_SIZE];
 			void *p;
 
 			/*
@@ -1220,22 +1232,36 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 
 			set_bit(off, vma->page_bitmap);
 			if (vma_inherited(vma)) {
+				unsigned long batch = min_t(unsigned long, nr_pages - i, COW_COMPARE_BATCH_PAGES);
+				unsigned long j;
+
+				batch = min_t(unsigned long, batch, (vma->e->end - va) / PAGE_SIZE);
 				clear_bit(off, vma->pvma->page_bitmap);
 
-				ret = pr->read_pages(pr, va, 1, buf, 0);
+				ret = pr->read_pages(pr, va, batch, cow_buf, 0);
 				if (ret < 0)
 					goto err_read;
 
-				va += PAGE_SIZE;
-				nr_compared++;
+				nr_cow_batches++;
+				for (j = 0; j < batch; j++) {
+					void *curr_p = decode_pointer((off + j) * PAGE_SIZE + vma->premmaped_addr);
+					void *curr_buf = cow_buf + j * PAGE_SIZE;
 
-				if (memcmp(p, buf, PAGE_SIZE) == 0) {
-					nr_shared++; /* the page is cowed */
-					continue;
+					set_bit(off + j, vma->page_bitmap);
+					clear_bit(off + j, vma->pvma->page_bitmap);
+					nr_compared++;
+
+					if (memcmp(curr_p, curr_buf, PAGE_SIZE) == 0) {
+						nr_shared++; /* the page is cowed */
+						continue;
+					}
+
+					nr_restored++;
+					memcpy(curr_p, curr_buf, PAGE_SIZE);
 				}
 
-				nr_restored++;
-				memcpy(p, buf, PAGE_SIZE);
+				va += batch * PAGE_SIZE;
+				i += batch - 1;
 			} else {
 				int nr;
 
@@ -1264,12 +1290,14 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	}
 
 err_read:
-	if (pr->sync(pr))
-		return -1;
+	if (pr->sync(pr)) {
+		ret = -1;
+		goto out;
+	}
 
 	pr->close(pr);
 	if (ret < 0)
-		return ret;
+		goto out;
 
 	/* Remove pages, which were not shared with a child */
 	list_for_each_entry(vma, vmas, list) {
@@ -1309,12 +1337,19 @@ err_read:
 	pr_info("nr_dropped_pages:  %d\n", nr_dropped);
 	pr_info("nr_enqueued:       %d\n", nr_enqueued);
 	pr_info("nr_lazy:           %d\n", nr_lazy);
+	gettimeofday(&cow_tv1, NULL);
+	pr_info("restore_priv_vma_content %lu ms (%u compared, %u shared, %u restored, %u cow batches)\n",
+		(unsigned long)((cow_tv1.tv_sec - cow_tv0.tv_sec) * 1000 + (cow_tv1.tv_usec - cow_tv0.tv_usec) / 1000),
+		nr_compared, nr_shared, nr_restored, nr_cow_batches);
 
-	return 0;
+out:
+	xfree(cow_buf);
+	return ret;
 
 err_addr:
 	pr_err("Page entry address %lx outside of VMA %lx-%lx\n", va, (long)vma->e->start, (long)vma->e->end);
-	return -1;
+	ret = -1;
+	goto err_read;
 }
 
 static int maybe_disable_thp(struct pstree_item *t, struct page_read *pr)

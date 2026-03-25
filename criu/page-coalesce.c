@@ -37,6 +37,7 @@
  */
 #define COALESCE_MAX_THREADS 48
 #define COALESCE_INITIAL_SLOTS (1 << 22)
+#define COALESCE_STREAM_QUEUE_DEPTH 2
 
 static const unsigned char zero_page[PAGE_SIZE] __attribute__((aligned(64)));
 
@@ -186,10 +187,22 @@ struct compact_page_stream {
 	u64 *chunk_group_offsets;
 	u64 *offsets;
 	struct iovec *blob_iov;
-	char *pages_buf;
+	char *pages_buf[COALESCE_STREAM_QUEUE_DEPTH];
 	size_t chunk_groups_cap;
 	u32 pages_id;
 	u32 chunk_group_generation;
+	pthread_t thread;
+	pthread_mutex_t lock;
+	pthread_cond_t ready;
+	pthread_cond_t space;
+	unsigned int fill_slot;
+	unsigned int drain_slot;
+	unsigned int nr_ready;
+	unsigned int queued_pages[COALESCE_STREAM_QUEUE_DEPTH];
+	bool stop;
+	bool failed;
+	bool sync_inited;
+	bool worker_started;
 	u64 present_pages;
 	u64 zero_pages;
 	u64 unique_pages;
@@ -1204,13 +1217,21 @@ static int read_pipe_exact(int pipefd, void *buf, size_t len)
 
 static void free_compact_page_stream(struct compact_page_stream *stream)
 {
+	unsigned int i;
+
 	if (!stream)
 		return;
 
 	if (stream->index)
 		close_image(stream->index);
+	if (stream->sync_inited) {
+		pthread_cond_destroy(&stream->space);
+		pthread_cond_destroy(&stream->ready);
+		pthread_mutex_destroy(&stream->lock);
+	}
 	xfree(stream->chunk_groups);
-	xfree(stream->pages_buf);
+	for (i = 0; i < COALESCE_STREAM_QUEUE_DEPTH; i++)
+		xfree(stream->pages_buf[i]);
 	xfree(stream->chunk_group_offsets);
 	xfree(stream->chunk_rep_page);
 	xfree(stream->chunk_group_of_page);
@@ -1220,13 +1241,12 @@ static void free_compact_page_stream(struct compact_page_stream *stream)
 	xfree(stream);
 }
 
-static int coalesce_stream_chunk_locked(struct compact_page_stream *stream, unsigned int chunk_pages)
+static int coalesce_stream_chunk_locked(struct compact_page_stream *stream, const char *pages, unsigned int chunk_pages)
 {
 	struct coalesce_worker_state *state = &online_state;
 	unsigned int nr_blob_pages = 0;
 	unsigned int group_count = 0;
 	unsigned int chunk_nonzero_pages = 0;
-	const char *pages = stream->pages_buf;
 	u64 lookup_start_us;
 	u64 step_start_us;
 	unsigned int j;
@@ -1320,9 +1340,67 @@ static int coalesce_stream_chunk_locked(struct compact_page_stream *stream, unsi
 	return 0;
 }
 
+static void stop_compact_page_stream_worker(struct compact_page_stream *stream)
+{
+	if (!stream || !stream->worker_started)
+		return;
+
+	pthread_mutex_lock(&stream->lock);
+	stream->stop = true;
+	pthread_cond_broadcast(&stream->ready);
+	pthread_cond_broadcast(&stream->space);
+	pthread_mutex_unlock(&stream->lock);
+
+	pthread_join(stream->thread, NULL);
+	stream->worker_started = false;
+}
+
+static void *compact_stream_worker_main(void *arg)
+{
+	struct compact_page_stream *stream = arg;
+
+	for (;;) {
+		unsigned int slot;
+		unsigned int chunk_pages;
+		bool failed = false;
+
+		pthread_mutex_lock(&stream->lock);
+		while (stream->nr_ready == 0 && !stream->stop && !stream->failed)
+			pthread_cond_wait(&stream->ready, &stream->lock);
+
+		if (stream->failed || (stream->stop && stream->nr_ready == 0)) {
+			pthread_mutex_unlock(&stream->lock);
+			return NULL;
+		}
+
+		slot = stream->drain_slot;
+		chunk_pages = stream->queued_pages[slot];
+		pthread_mutex_unlock(&stream->lock);
+
+		pthread_mutex_lock(&online_state.lock);
+		if (online_state.failed || coalesce_stream_chunk_locked(stream, stream->pages_buf[slot], chunk_pages)) {
+			online_state.failed = true;
+			failed = true;
+		}
+		pthread_mutex_unlock(&online_state.lock);
+
+		pthread_mutex_lock(&stream->lock);
+		stream->drain_slot = (stream->drain_slot + 1) % COALESCE_STREAM_QUEUE_DEPTH;
+		stream->nr_ready--;
+		if (failed)
+			stream->failed = true;
+		pthread_cond_broadcast(&stream->space);
+		pthread_mutex_unlock(&stream->lock);
+
+		if (failed)
+			return NULL;
+	}
+}
+
 int coalesce_checkpoint_pages_open_stream(u32 pages_id, struct compact_page_stream **out)
 {
 	struct compact_page_stream *stream;
+	unsigned int i;
 
 	*out = NULL;
 	if (!should_run_page_coalesce() || !online_state.started)
@@ -1338,31 +1416,44 @@ int coalesce_checkpoint_pages_open_stream(u32 pages_id, struct compact_page_stre
 	stream->chunk_group_of_page = xzalloc(COALESCE_BATCH_PAGES * sizeof(*stream->chunk_group_of_page));
 	stream->chunk_rep_page = xzalloc(COALESCE_BATCH_PAGES * sizeof(*stream->chunk_rep_page));
 	stream->chunk_group_offsets = xzalloc(COALESCE_BATCH_PAGES * sizeof(*stream->chunk_group_offsets));
-	stream->pages_buf = xzalloc((size_t)COALESCE_BATCH_PAGES * PAGE_SIZE);
+	for (i = 0; i < COALESCE_STREAM_QUEUE_DEPTH; i++)
+		stream->pages_buf[i] = xzalloc((size_t)COALESCE_BATCH_PAGES * PAGE_SIZE);
 	stream->chunk_groups_cap = next_power_of_two(COALESCE_BATCH_PAGES * 2);
 	stream->chunk_groups = xzalloc(stream->chunk_groups_cap * sizeof(*stream->chunk_groups));
 	if (!stream->meta || !stream->offsets || !stream->blob_iov || !stream->chunk_group_of_page || !stream->chunk_rep_page ||
-	    !stream->chunk_group_offsets || !stream->pages_buf || !stream->chunk_groups)
+	    !stream->chunk_group_offsets || !stream->chunk_groups)
 		goto err;
+	for (i = 0; i < COALESCE_STREAM_QUEUE_DEPTH; i++) {
+		if (!stream->pages_buf[i])
+			goto err;
+	}
 
 	stream->index = open_image_at(online_state.dfd, CR_FD_PAGE_INDEX, O_DUMP, pages_id);
 	if (!stream->index)
 		goto err;
 
+	pthread_mutex_init(&stream->lock, NULL);
+	pthread_cond_init(&stream->ready, NULL);
+	pthread_cond_init(&stream->space, NULL);
+	stream->sync_inited = true;
 	stream->pages_id = pages_id;
 	stream->chunk_group_generation = 1;
+	if (pthread_create(&stream->thread, NULL, compact_stream_worker_main, stream) != 0) {
+		pr_err("pthread_create failed for compact page stream worker\n");
+		goto err;
+	}
+	stream->worker_started = true;
 	*out = stream;
 	return 0;
 
 err:
+	stop_compact_page_stream_worker(stream);
 	free_compact_page_stream(stream);
 	return -1;
 }
 
 int coalesce_checkpoint_pages_write_stream(struct compact_page_stream *stream, int pipefd, unsigned long len)
 {
-	u64 read_start_us = now_us();
-
 	if (!stream)
 		return 0;
 	if (len & (PAGE_SIZE - 1)) {
@@ -1373,29 +1464,41 @@ int coalesce_checkpoint_pages_write_stream(struct compact_page_stream *stream, i
 	while (len > 0) {
 		size_t chunk = len;
 		unsigned int chunk_pages;
+		unsigned int slot;
+		u64 step_start_us;
 
 		if (chunk > (size_t)COALESCE_BATCH_PAGES * PAGE_SIZE)
 			chunk = (size_t)COALESCE_BATCH_PAGES * PAGE_SIZE;
 		chunk_pages = chunk / PAGE_SIZE;
 
-		if (read_pipe_exact(pipefd, stream->pages_buf, chunk))
+		pthread_mutex_lock(&stream->lock);
+		while (stream->nr_ready == COALESCE_STREAM_QUEUE_DEPTH && !stream->failed)
+			pthread_cond_wait(&stream->space, &stream->lock);
+		if (stream->failed) {
+			pthread_mutex_unlock(&stream->lock);
 			return -1;
+		}
+		slot = stream->fill_slot;
+		pthread_mutex_unlock(&stream->lock);
 
-		pthread_mutex_lock(&online_state.lock);
-		if (online_state.failed) {
-			pthread_mutex_unlock(&online_state.lock);
+		step_start_us = now_us();
+		if (read_pipe_exact(pipefd, stream->pages_buf[slot], chunk))
+			return -1;
+		stream->read_us += now_us() - step_start_us;
+
+		pthread_mutex_lock(&stream->lock);
+		if (stream->failed) {
+			pthread_mutex_unlock(&stream->lock);
 			return -1;
 		}
-		if (coalesce_stream_chunk_locked(stream, chunk_pages)) {
-			online_state.failed = true;
-			pthread_mutex_unlock(&online_state.lock);
-			return -1;
-		}
-		pthread_mutex_unlock(&online_state.lock);
+		stream->queued_pages[slot] = chunk_pages;
+		stream->fill_slot = (stream->fill_slot + 1) % COALESCE_STREAM_QUEUE_DEPTH;
+		stream->nr_ready++;
+		pthread_cond_signal(&stream->ready);
+		pthread_mutex_unlock(&stream->lock);
 		len -= chunk;
 	}
 
-	stream->read_us += now_us() - read_start_us;
 	return 0;
 }
 
@@ -1408,9 +1511,10 @@ int coalesce_checkpoint_pages_close_stream(struct compact_page_stream *stream)
 		return 0;
 
 	snprintf(index_path, sizeof(index_path), imgset_template[CR_FD_PAGE_INDEX].fmt, stream->pages_id);
+	stop_compact_page_stream_worker(stream);
 
 	pthread_mutex_lock(&online_state.lock);
-	if (!online_state.failed) {
+	if (!stream->failed && !online_state.failed) {
 		if (compact_image_set_add(&online_state.compact, stream->pages_id)) {
 			online_state.failed = true;
 			ret = -1;
@@ -1458,6 +1562,14 @@ void coalesce_checkpoint_pages_discard_stream(struct compact_page_stream *stream
 		return;
 
 	snprintf(index_path, sizeof(index_path), imgset_template[CR_FD_PAGE_INDEX].fmt, stream->pages_id);
+	if (stream->worker_started) {
+		pthread_mutex_lock(&stream->lock);
+		stream->failed = true;
+		pthread_cond_broadcast(&stream->ready);
+		pthread_cond_broadcast(&stream->space);
+		pthread_mutex_unlock(&stream->lock);
+	}
+	stop_compact_page_stream_worker(stream);
 	free_compact_page_stream(stream);
 
 	if (index_path[0] && unlinkat(online_state.dfd, index_path, 0) && errno != ENOENT)

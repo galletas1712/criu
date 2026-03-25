@@ -6,12 +6,11 @@
 #include <string.h>
 #include <linux/falloc.h>
 #include <sys/time.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <limits.h>
 
 #include <linux/aio_abi.h>
-
-#include "compel/plugins/std/syscall.h"
 
 #include "types.h"
 #include "image.h"
@@ -75,6 +74,33 @@ static inline bool compact_io_is_zero(off_t off);
 static inline bool compact_io_is_zero_skip(off_t off);
 static inline bool compact_io_is_run(off_t off);
 static inline off_t compact_io_decode(off_t off);
+static void free_page_read_iov(struct page_read_iov *piov);
+
+static inline long local_io_setup(unsigned int nr_events, aio_context_t *ctx)
+{
+	return syscall(__NR_io_setup, nr_events, ctx);
+}
+
+static inline long local_io_destroy(aio_context_t ctx)
+{
+	return syscall(__NR_io_destroy, ctx);
+}
+
+static inline long local_io_submit(aio_context_t ctx, long nr, struct iocb **iocbpp)
+{
+	return syscall(__NR_io_submit, ctx, nr, iocbpp);
+}
+
+static inline long local_io_getevents(aio_context_t ctx, long min_nr, long nr, struct io_event *events,
+				      struct timespec *timeout)
+{
+	return syscall(__NR_io_getevents, ctx, min_nr, nr, events, timeout);
+}
+
+static inline u64 timeval_delta_us(const struct timeval *start, const struct timeval *end)
+{
+	return (u64)(end->tv_sec - start->tv_sec) * 1000000ULL + (u64)(end->tv_usec - start->tv_usec);
+}
 
 static bool direct_io_aligned(const void *buf, size_t len, off_t off)
 {
@@ -345,7 +371,7 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 		i++;
 	}
 
-	if (sys_io_setup(COMPACT_AIO_BATCH, &aio_ctx) < 0) {
+	if (local_io_setup(COMPACT_AIO_BATCH, &aio_ctx) < 0) {
 		pr_warn("io_setup(%d) failed, falling back to buffered compact restore\n", COMPACT_AIO_BATCH);
 		goto out;
 	}
@@ -373,7 +399,7 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 				batch = COMPACT_AIO_BATCH - (submitted - completed);
 
 			sys_gettimeofday(&stamp0, NULL);
-			ret = sys_io_submit(aio_ctx, batch, &iocbps[submitted]);
+			ret = local_io_submit(aio_ctx, batch, &iocbps[submitted]);
 			sys_gettimeofday(&stamp1, NULL);
 			aio_submit_us += (unsigned long)timeval_delta_us(&stamp0, &stamp1);
 			if (ret <= 0) {
@@ -393,7 +419,7 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 			long event_nr;
 
 			sys_gettimeofday(&stamp0, NULL);
-			event_nr = sys_io_getevents(aio_ctx, 1, COMPACT_AIO_BATCH, events, NULL);
+			event_nr = local_io_getevents(aio_ctx, 1, COMPACT_AIO_BATCH, events, NULL);
 			sys_gettimeofday(&stamp1, NULL);
 			aio_wait_us += (unsigned long)timeval_delta_us(&stamp0, &stamp1);
 			if (event_nr <= 0) {
@@ -417,7 +443,7 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 					goto out;
 				}
 				if (events[k].res == 0) {
-					pr_warn("compact AIO zero read (expected %llu), falling back to buffered compact restore\n",
+					pr_warn("compact AIO zero read (expected %zu), falling back to buffered compact restore\n",
 						job->expected);
 					goto out;
 				}
@@ -448,7 +474,7 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 				job->iocb.aio_offset = job->file_from;
 				job->iocb.aio_data = job->remaining;
 				sys_gettimeofday(&stamp0, NULL);
-				ret = sys_io_submit(aio_ctx, 1, &cb);
+				ret = local_io_submit(aio_ctx, 1, &cb);
 				sys_gettimeofday(&stamp1, NULL);
 				aio_submit_us += (unsigned long)timeval_delta_us(&stamp0, &stamp1);
 				if (ret != 1) {
@@ -463,7 +489,7 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 
 	ret = 0;
 	sys_gettimeofday(&aio_tv1, NULL);
-	sys_io_destroy(aio_ctx);
+	local_io_destroy(aio_ctx);
 	sys_munmap(iocbs, alloc_sz);
 	pr_info("pagemap async aio sort %lu ms merge %lu ms jobs %u->%u fadvise %lu ms aio %lu ms (submit %lu ms wait %lu ms, %u submits %u gets %u short %u resubmit, max inflight %u) zero-skip %zu MiB (%u ios) zero-fill %zu MiB (%u ios) copy %lu ms (%zu MiB, %u ios) read %zu MiB (%u ios, %u short, max %u iovs, max %u copies) (range %zu MiB)\n",
 		(unsigned long)(sort_us / 1000ULL), (unsigned long)(merge_us / 1000ULL), queue_jobs, merged_jobs,
@@ -488,7 +514,7 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 
 out:
 	if (aio_ctx_ready)
-		sys_io_destroy(aio_ctx);
+		local_io_destroy(aio_ctx);
 	if (iocbs_mapped)
 		sys_munmap(iocbs, alloc_sz);
 	free_compact_aio_jobs(jobs, aio_n);

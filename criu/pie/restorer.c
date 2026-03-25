@@ -2074,6 +2074,10 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	pr_info("VMA restore map %lu ms (%u vmas)\n",
 		(unsigned long)(vma_map_us / 1000ULL),
 		args->vmas_n);
+	pr_info("Restorer pre-page-replay summary shift %lu ms map %lu ms total %lu ms\n",
+		(unsigned long)(vma_shift_us / 1000ULL),
+		(unsigned long)(vma_map_us / 1000ULL),
+		(unsigned long)((vma_shift_us + vma_map_us) / 1000ULL));
 
 	/*
 	 * Now read the contents (if any).

@@ -179,6 +179,7 @@ struct restore_tail_stats {
 	u64 pre_resume_us;
 	u64 restore_freezer_us;
 	u64 finalize_detach_us;
+	u64 attach_to_tasks_us;
 	struct catch_tasks_stats catch_tasks;
 };
 
@@ -264,29 +265,72 @@ static int restore_finish_ns_stage(int from, int to)
 
 static int crtools_prepare_shared(void)
 {
-	if (prepare_memfd_inodes())
+	u64 total_start_us = restore_tail_now_us();
+	u64 memfd_us = 0;
+	u64 files_us = 0;
+	u64 remaps_us = 0;
+	u64 inet_us = 0;
+	u64 binfmt_us = 0;
+	u64 tty_us = 0;
+	u64 apparmor_us = 0;
+	u64 step_start_us;
+	int ret;
+
+	step_start_us = restore_tail_now_us();
+	ret = prepare_memfd_inodes();
+	memfd_us = restore_tail_now_us() - step_start_us;
+	if (ret)
 		return -1;
 
-	if (prepare_files())
+	step_start_us = restore_tail_now_us();
+	ret = prepare_files();
+	files_us = restore_tail_now_us() - step_start_us;
+	if (ret)
 		return -1;
 
 	/* We might want to remove ghost files on failed restore */
-	if (collect_remaps_and_regfiles())
+	step_start_us = restore_tail_now_us();
+	ret = collect_remaps_and_regfiles();
+	remaps_us = restore_tail_now_us() - step_start_us;
+	if (ret)
 		return -1;
 
 	/* Connections are unlocked from criu */
-	if (!files_collected() && collect_image(&inet_sk_cinfo))
+	if (!files_collected()) {
+		step_start_us = restore_tail_now_us();
+		ret = collect_image(&inet_sk_cinfo);
+		inet_us = restore_tail_now_us() - step_start_us;
+		if (ret)
+			return -1;
+	}
+
+	step_start_us = restore_tail_now_us();
+	ret = collect_binfmt_misc();
+	binfmt_us = restore_tail_now_us() - step_start_us;
+	if (ret)
 		return -1;
 
-	if (collect_binfmt_misc())
+	step_start_us = restore_tail_now_us();
+	ret = tty_prep_fds();
+	tty_us = restore_tail_now_us() - step_start_us;
+	if (ret)
 		return -1;
 
-	if (tty_prep_fds())
+	step_start_us = restore_tail_now_us();
+	ret = prepare_apparmor_namespaces();
+	apparmor_us = restore_tail_now_us() - step_start_us;
+	if (ret)
 		return -1;
 
-	if (prepare_apparmor_namespaces())
-		return -1;
-
+	pr_info("Restore shared prep summary phase=crtools memfd=%llu ms files=%llu ms remaps=%llu ms inet=%llu ms binfmt=%llu ms tty=%llu ms apparmor=%llu ms total=%llu ms\n",
+		(unsigned long long)(memfd_us / 1000ULL),
+		(unsigned long long)(files_us / 1000ULL),
+		(unsigned long long)(remaps_us / 1000ULL),
+		(unsigned long long)(inet_us / 1000ULL),
+		(unsigned long long)(binfmt_us / 1000ULL),
+		(unsigned long long)(tty_us / 1000ULL),
+		(unsigned long long)(apparmor_us / 1000ULL),
+		(unsigned long long)((restore_tail_now_us() - total_start_us) / 1000ULL));
 	return 0;
 }
 
@@ -342,21 +386,50 @@ static int root_prepare_shared(void)
 {
 	int ret = 0;
 	struct pstree_item *pi;
+	u64 total_start_us = restore_tail_now_us();
+	u64 remaps_us = 0;
+	u64 seccomp_us = 0;
+	u64 shared_images_us = 0;
+	u64 file_images_us = 0;
+	u64 per_pid_us = 0;
+	u64 cow_us = 0;
+	u64 restorer_blob_us = 0;
+	u64 fake_unix_us = 0;
+	u64 scms_us = 0;
+	u64 post_prepare_us = 0;
+	u64 unix_root_us = 0;
+	u64 saved_files_us = 0;
+	u64 step_start_us;
 
 	pr_info("Preparing info about shared resources\n");
 
-	if (prepare_remaps())
+	step_start_us = restore_tail_now_us();
+	ret = prepare_remaps();
+	remaps_us = restore_tail_now_us() - step_start_us;
+	if (ret)
 		return -1;
 
-	if (seccomp_read_image())
+	step_start_us = restore_tail_now_us();
+	ret = seccomp_read_image();
+	seccomp_us = restore_tail_now_us() - step_start_us;
+	if (ret)
 		return -1;
 
-	if (collect_images(cinfos, ARRAY_SIZE(cinfos)))
+	step_start_us = restore_tail_now_us();
+	ret = collect_images(cinfos, ARRAY_SIZE(cinfos));
+	shared_images_us = restore_tail_now_us() - step_start_us;
+	if (ret)
 		return -1;
 
-	if (!files_collected() && collect_images(cinfos_files, ARRAY_SIZE(cinfos_files)))
-		return -1;
+	if (!files_collected()) {
+		step_start_us = restore_tail_now_us();
+		ret = collect_images(cinfos_files, ARRAY_SIZE(cinfos_files));
+		file_images_us = restore_tail_now_us() - step_start_us;
+		if (ret)
+			return -1;
+	}
 
+	step_start_us = restore_tail_now_us();
 	for_each_pstree_item(pi) {
 		if (pi->pid->state == TASK_HELPER)
 			continue;
@@ -373,17 +446,24 @@ static int root_prepare_shared(void)
 		if (ret < 0)
 			break;
 	}
+	per_pid_us = restore_tail_now_us() - step_start_us;
 
 	if (ret < 0)
 		goto err;
 
+	step_start_us = restore_tail_now_us();
 	prepare_cow_vmas();
+	cow_us = restore_tail_now_us() - step_start_us;
 
+	step_start_us = restore_tail_now_us();
 	ret = prepare_restorer_blob();
+	restorer_blob_us = restore_tail_now_us() - step_start_us;
 	if (ret)
 		goto err;
 
+	step_start_us = restore_tail_now_us();
 	ret = add_fake_unix_queuers();
+	fake_unix_us = restore_tail_now_us() - step_start_us;
 	if (ret)
 		goto err;
 
@@ -391,19 +471,41 @@ static int root_prepare_shared(void)
 	 * This should be called with all packets collected AND all
 	 * fdescs and fles prepared BUT post-prep-s not run.
 	 */
+	step_start_us = restore_tail_now_us();
 	ret = prepare_scms();
+	scms_us = restore_tail_now_us() - step_start_us;
 	if (ret)
 		goto err;
 
+	step_start_us = restore_tail_now_us();
 	ret = run_post_prepare();
+	post_prepare_us = restore_tail_now_us() - step_start_us;
 	if (ret)
 		goto err;
 
+	step_start_us = restore_tail_now_us();
 	ret = unix_prepare_root_shared();
+	unix_root_us = restore_tail_now_us() - step_start_us;
 	if (ret)
 		goto err;
 
+	step_start_us = restore_tail_now_us();
 	show_saved_files();
+	saved_files_us = restore_tail_now_us() - step_start_us;
+	pr_info("Restore shared prep summary phase=root remaps=%llu ms seccomp=%llu ms shared-images=%llu ms file-images=%llu ms per-pid=%llu ms cow=%llu ms restorer-blob=%llu ms fake-unix=%llu ms scms=%llu ms post-prepare=%llu ms unix-root=%llu ms saved-files=%llu ms total=%llu ms\n",
+		(unsigned long long)(remaps_us / 1000ULL),
+		(unsigned long long)(seccomp_us / 1000ULL),
+		(unsigned long long)(shared_images_us / 1000ULL),
+		(unsigned long long)(file_images_us / 1000ULL),
+		(unsigned long long)(per_pid_us / 1000ULL),
+		(unsigned long long)(cow_us / 1000ULL),
+		(unsigned long long)(restorer_blob_us / 1000ULL),
+		(unsigned long long)(fake_unix_us / 1000ULL),
+		(unsigned long long)(scms_us / 1000ULL),
+		(unsigned long long)(post_prepare_us / 1000ULL),
+		(unsigned long long)(unix_root_us / 1000ULL),
+		(unsigned long long)(saved_files_us / 1000ULL),
+		(unsigned long long)((restore_tail_now_us() - total_start_us) / 1000ULL));
 err:
 	return ret;
 }
@@ -1741,17 +1843,32 @@ int arch_ptrace_restore(int pid, struct pstree_item *item) { return 0; }
 
 static int attach_to_tasks(bool root_seized)
 {
+	u64 total_start_us = restore_tail_now_us();
+	u64 parse_threads_us = 0;
+	u64 seize_us = 0;
+	u64 interrupt_us = 0;
+	u64 wait_us = 0;
+	u64 setoptions_us = 0;
+	u64 restore_regs_us = 0;
+	u64 seccomp_us = 0;
+	u64 cont_us = 0;
+	u64 tasks = 0;
+	u64 threads = 0;
 	struct pstree_item *item;
 
 	for_each_pstree_item(item) {
 		int status, i;
+		u64 step_start_us;
 
 		if (!task_alive(item))
 			continue;
+		tasks++;
 
 		/* Parse threads for ptrace attach */
+		step_start_us = restore_tail_now_us();
 		if (parse_threads(item->pid->real, &item->threads, &item->nr_threads))
 			return -1;
+		parse_threads_us += restore_tail_now_us() - step_start_us;
 
 		/*
 		 * nr_threads must equal nr_threads_image: all pthread workers
@@ -1765,30 +1882,44 @@ static int attach_to_tasks(bool root_seized)
 
 		for (i = 0; i < item->nr_threads; i++) {
 			pid_t pid = item->threads[i].real;
+			u64 phase_start_us;
 
+			threads++;
+
+			phase_start_us = restore_tail_now_us();
 			if (item != root_item || !root_seized || i != 0) {
 				if (ptrace(PTRACE_SEIZE, pid, 0, 0)) {
 					pr_perror("Can't attach to %d", pid);
 					return -1;
 				}
 			}
+			seize_us += restore_tail_now_us() - phase_start_us;
+
+			phase_start_us = restore_tail_now_us();
 			if (ptrace(PTRACE_INTERRUPT, pid, 0, 0)) {
 				pr_perror("Can't interrupt the %d task", pid);
 				return -1;
 			}
+			interrupt_us += restore_tail_now_us() - phase_start_us;
 
+			phase_start_us = restore_tail_now_us();
 			if (wait4(pid, &status, __WALL, NULL) != pid) {
 				pr_perror("waitpid(%d) failed", pid);
 				return -1;
 			}
+			wait_us += restore_tail_now_us() - phase_start_us;
 
+			phase_start_us = restore_tail_now_us();
 			if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD)) {
 				pr_perror("Unable to set PTRACE_O_TRACESYSGOOD for %d", pid);
 				return -1;
 			}
+			setoptions_us += restore_tail_now_us() - phase_start_us;
 			/* Only restore regs for image threads; workers have no core */
+			phase_start_us = restore_tail_now_us();
 			if (i < item->nr_threads_image && arch_ptrace_restore(pid, item))
 				return -1;
+			restore_regs_us += restore_tail_now_us() - phase_start_us;
 			/*
 			 * Suspend seccomp if necessary. We need to do this because
 			 * although seccomp is restored at the very end of the
@@ -1796,16 +1927,32 @@ static int attach_to_tasks(bool root_seized)
 			 * doing an munmap in the process, which may be blocked by
 			 * seccomp and cause the task to be killed.
 			 */
+			phase_start_us = restore_tail_now_us();
 			if (rsti(item)->has_seccomp && ptrace_suspend_seccomp(pid) < 0)
 				pr_err("failed to suspend seccomp, restore will probably fail...\n");
+			seccomp_us += restore_tail_now_us() - phase_start_us;
 
+			phase_start_us = restore_tail_now_us();
 			if (ptrace(PTRACE_CONT, pid, NULL, NULL)) {
 				pr_perror("Unable to resume %d", pid);
 				return -1;
 			}
+			cont_us += restore_tail_now_us() - phase_start_us;
 		}
 	}
 
+	pr_info("Restore attach summary tasks=%llu threads=%llu parse=%llu ms seize=%llu ms interrupt=%llu ms wait=%llu ms setopts=%llu ms restore-regs=%llu ms seccomp=%llu ms cont=%llu ms total=%llu ms\n",
+		(unsigned long long)tasks,
+		(unsigned long long)threads,
+		(unsigned long long)(parse_threads_us / 1000ULL),
+		(unsigned long long)(seize_us / 1000ULL),
+		(unsigned long long)(interrupt_us / 1000ULL),
+		(unsigned long long)(wait_us / 1000ULL),
+		(unsigned long long)(setoptions_us / 1000ULL),
+		(unsigned long long)(restore_regs_us / 1000ULL),
+		(unsigned long long)(seccomp_us / 1000ULL),
+		(unsigned long long)(cont_us / 1000ULL),
+		(unsigned long long)((restore_tail_now_us() - total_start_us) / 1000ULL));
 	return 0;
 }
 
@@ -1847,6 +1994,7 @@ static int restore_rseq_cs(void)
 
 static int catch_tasks(bool root_seized, struct catch_tasks_stats *stats)
 {
+	u64 total_start_us = restore_tail_now_us();
 	struct pstree_item *item;
 	bool nobp = fault_injected(FI_NO_BREAKPOINTS) || !kdat.has_breakpoints;
 
@@ -1885,32 +2033,49 @@ static int catch_tasks(bool root_seized, struct catch_tasks_stats *stats)
 		}
 	}
 
+	pr_info("Restore catch summary root-seized=%u threads=%llu interrupt-wait=%llu ms stop-pie=%llu ms total=%llu ms\n",
+		root_seized,
+		(unsigned long long)(stats ? stats->threads : 0),
+		(unsigned long long)(stats ? (stats->interrupt_wait_us / 1000ULL) : 0),
+		(unsigned long long)(stats ? (stats->stop_pie_us / 1000ULL) : 0),
+		(unsigned long long)((restore_tail_now_us() - total_start_us) / 1000ULL));
 	return 0;
 }
 
 static void finalize_restore(void)
 {
+	u64 total_start_us = restore_tail_now_us();
+	u64 unmap_us = 0;
+	u64 signal_us = 0;
+	u64 tasks = 0;
 	struct pstree_item *item;
 
 	for_each_pstree_item(item) {
 		pid_t pid = item->pid->real;
 		struct parasite_ctl *ctl;
 		unsigned long restorer_addr;
+		u64 step_start_us;
 
 		if (!task_alive(item))
 			continue;
+		tasks++;
 
 		/* Unmap the restorer blob */
+		step_start_us = restore_tail_now_us();
 		ctl = compel_prepare_noctx(pid);
+		unmap_us += restore_tail_now_us() - step_start_us;
 		if (ctl == NULL)
 			continue;
 
+		step_start_us = restore_tail_now_us();
 		restorer_addr = (unsigned long)rsti(item)->munmap_restorer;
 		if (compel_unmap(ctl, restorer_addr))
 			pr_err("Failed to unmap restorer from %d\n", pid);
+		unmap_us += restore_tail_now_us() - step_start_us;
 
 		xfree(ctl);
 
+		step_start_us = restore_tail_now_us();
 		if (opts.final_state == TASK_STOPPED)
 			kill(item->pid->real, SIGSTOP);
 		else if (item->pid->state == TASK_STOPPED) {
@@ -1919,28 +2084,44 @@ static void finalize_restore(void)
 			else
 				kill(item->pid->real, SIGSTOP);
 		}
+		signal_us += restore_tail_now_us() - step_start_us;
 	}
+
+	pr_info("Restore finalize summary tasks=%llu unmap=%llu ms signal=%llu ms total=%llu ms\n",
+		(unsigned long long)tasks,
+		(unsigned long long)(unmap_us / 1000ULL),
+		(unsigned long long)(signal_us / 1000ULL),
+		(unsigned long long)((restore_tail_now_us() - total_start_us) / 1000ULL));
 }
 
 static int finalize_restore_detach(void)
 {
+	u64 total_start_us = restore_tail_now_us();
+	u64 restore_regs_us = 0;
+	u64 detach_us = 0;
+	u64 tasks = 0;
+	u64 threads = 0;
 	struct pstree_item *item;
 
 	for_each_pstree_item(item) {
 		pid_t pid;
 		int i;
+		u64 step_start_us;
 
 		if (!task_alive(item))
 			continue;
+		tasks++;
 
 		for (i = 0; i < item->nr_threads; i++) {
 			pid = item->threads[i].real;
+			threads++;
 			if (pid < 0) {
 				pr_err("pstree item has invalid pid %d\n", pid);
 				continue;
 			}
 
 			/* Restore regs for image threads only */
+			step_start_us = restore_tail_now_us();
 			if (i < item->nr_threads_image) {
 				if (arch_set_thread_regs_nosigrt(&item->threads[i])) {
 					if (errno == ESRCH) {
@@ -1951,6 +2132,9 @@ static int finalize_restore_detach(void)
 					return -1;
 				}
 			}
+			restore_regs_us += restore_tail_now_us() - step_start_us;
+
+			step_start_us = restore_tail_now_us();
 			if (ptrace(PTRACE_DETACH, pid, NULL, 0)) {
 				if (errno == ESRCH) {
 					pr_warn("Thread %d already exited, skipping detach\n", pid);
@@ -1959,8 +2143,16 @@ static int finalize_restore_detach(void)
 				pr_perror("Unable to detach %d", pid);
 				return -1;
 			}
+			detach_us += restore_tail_now_us() - step_start_us;
 		}
 	}
+
+	pr_info("Restore detach summary tasks=%llu threads=%llu restore-regs=%llu ms detach=%llu ms total=%llu ms\n",
+		(unsigned long long)tasks,
+		(unsigned long long)threads,
+		(unsigned long long)(restore_regs_us / 1000ULL),
+		(unsigned long long)(detach_us / 1000ULL),
+		(unsigned long long)((restore_tail_now_us() - total_start_us) / 1000ULL));
 	return 0;
 }
 
@@ -2255,7 +2447,9 @@ skip_ns_bouncing:
 	 * Network is unlocked. If something fails below - we lose data
 	 * or a connection.
 	 */
+	step_start_us = restore_tail_now_us();
 	attach_to_tasks(root_seized);
+	tail_stats.attach_to_tasks_us = restore_tail_now_us() - step_start_us;
 
 	step_start_us = restore_tail_now_us();
 	if (restore_switch_stage(CR_STATE_RESTORE_CREDS))
@@ -2338,7 +2532,8 @@ skip_ns_bouncing:
 		goto out_kill_network_unlocked;
 	tail_stats.finalize_detach_us = restore_tail_now_us() - step_start_us;
 
-	pr_info("Restore master tail summary wait-creds=%llu ms catch=%llu ms stop-on-syscall=%llu ms finalize=%llu ms rseq=%llu ms late-hook=%llu ms pre-resume=%llu ms freezer=%llu ms detach=%llu ms catch-threads=%llu catch-interrupt-wait=%llu ms catch-stop-pie=%llu ms\n",
+	pr_info("Restore master tail summary attach=%llu ms wait-creds=%llu ms catch=%llu ms stop-on-syscall=%llu ms finalize=%llu ms rseq=%llu ms late-hook=%llu ms pre-resume=%llu ms freezer=%llu ms detach=%llu ms catch-threads=%llu catch-interrupt-wait=%llu ms catch-stop-pie=%llu ms\n",
+		(unsigned long long)(tail_stats.attach_to_tasks_us / 1000ULL),
 		(unsigned long long)(tail_stats.wait_creds_barrier_us / 1000ULL),
 		(unsigned long long)(tail_stats.catch_tasks_us / 1000ULL),
 		(unsigned long long)(tail_stats.stop_on_syscall_us / 1000ULL),

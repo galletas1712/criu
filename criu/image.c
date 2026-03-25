@@ -630,6 +630,10 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 	flags = oflags & ~(O_NOBUF | O_SERVICE | O_FORCE_LOCAL | O_TRY_DIRECT_OPEN);
 	open_flags = flags;
 	try_direct_open = oflags & O_TRY_DIRECT_OPEN;
+	if (try_direct_open && (flags == O_RDONLY || flags == O_RDWR) && type == CR_FD_PAGES_BLOB) {
+		pr_info("O_DIRECT disabled for compact page blob %s\n", path);
+		try_direct_open = false;
+	}
 	if (try_direct_open && !opts.stream)
 		open_flags |= O_DIRECT;
 

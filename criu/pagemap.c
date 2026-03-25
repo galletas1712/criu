@@ -1029,7 +1029,7 @@ static int read_indexed_pages(struct page_read *pr, off_t logical_off, unsigned 
 			struct iovec bounce_iov_stack[64];
 			struct iovec *run_iov = run_iov_stack;
 			struct iovec *bounce_iov = NULL;
-			struct iovec *read_iov = run_iov;
+			struct iovec *read_iov;
 			unsigned int run_iov_n = run_pages - chunk_start;
 			unsigned int j;
 			ssize_t read_ret;
@@ -1045,6 +1045,7 @@ static int read_indexed_pages(struct page_read *pr, off_t logical_off, unsigned 
 					goto out;
 				}
 			}
+			read_iov = run_iov;
 
 			for (j = 0; j < run_iov_n; j++) {
 				run_iov[j].iov_base = groups[run_start + chunk_start + j].dsts[0];

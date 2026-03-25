@@ -76,6 +76,17 @@ static inline bool compact_io_is_run(off_t off);
 static inline off_t compact_io_decode(off_t off);
 static void free_page_read_iov(struct page_read_iov *piov);
 
+static size_t page_read_iov_len(const struct page_read_iov *piov)
+{
+	size_t len = 0;
+	unsigned int i;
+
+	for (i = 0; i < piov->nr; i++)
+		len += piov->to[i].iov_len;
+
+	return len;
+}
+
 static inline long local_io_setup(unsigned int nr_events, aio_context_t *ctx)
 {
 	return syscall(__NR_io_setup, nr_events, ctx);
@@ -302,7 +313,7 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 		return 1;
 
 	list_for_each_entry(piov, &pr->async, l) {
-		size_t remaining = (size_t)(piov->end - piov->from);
+		size_t remaining = page_read_iov_len(piov);
 
 		if (compact_io_is_zero(piov->from)) {
 			unsigned int j;
@@ -346,7 +357,7 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 
 	i = 0;
 	list_for_each_entry(piov, &pr->async, l) {
-		size_t remaining = (size_t)(piov->end - piov->from);
+		size_t remaining = page_read_iov_len(piov);
 
 		if (compact_io_is_zero(piov->from))
 			continue;
@@ -1910,7 +1921,7 @@ static int process_async_reads(struct page_read *pr)
 		if (compact_io_is_zero(piov->from))
 			continue;
 		file_from = compact_io_decode(piov->from);
-		file_end = file_from + (piov->end - piov->from);
+		file_end = file_from + page_read_iov_len(piov);
 		if (!have_range) {
 			first_off = file_from;
 			last_end = file_end;
@@ -1940,7 +1951,7 @@ static int process_async_reads(struct page_read *pr)
 	list_for_each_entry_safe(piov, n, &pr->async, l) {
 		ssize_t bytes;
 		bool io_failed = false;
-		size_t remaining = (size_t)(piov->end - piov->from);
+		size_t remaining = page_read_iov_len(piov);
 		off_t file_from = compact_io_decode(piov->from);
 
 		if (compact_io_is_zero(piov->from)) {

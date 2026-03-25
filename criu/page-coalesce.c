@@ -779,7 +779,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	unsigned int *chunk_group_of_page = NULL;
 	unsigned int *chunk_rep_page = NULL;
 	u64 *chunk_group_offsets = NULL;
-	u64 *offsets = NULL;
+	u64 *offset_buffers[2] = {};
 	struct iovec *blob_iov = NULL;
 	struct cr_img *index = NULL;
 	struct cr_img *old_pages = NULL;
@@ -793,6 +793,10 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	const char *old_pages_map = NULL;
 	bool old_pages_mapped = false;
 	size_t chunk_groups_cap;
+	unsigned int current_offsets = 0;
+	unsigned int pending_offsets = 0;
+	unsigned int pending_chunk_pages = 0;
+	bool have_pending_index = false;
 	u64 step_start_us = 0;
 	u64 image_start_us = 0;
 	u64 image_present_pages = 0;
@@ -809,15 +813,17 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	u32 chunk_group_generation = 1;
 	int ret = -1;
 
-	meta = xmalloc(COALESCE_BATCH_PAGES * sizeof(*meta));
-	offsets = xmalloc(COALESCE_BATCH_PAGES * sizeof(*offsets));
-	blob_iov = xmalloc(COALESCE_BATCH_PAGES * sizeof(*blob_iov));
-	chunk_group_of_page = xmalloc(COALESCE_BATCH_PAGES * sizeof(*chunk_group_of_page));
-	chunk_rep_page = xmalloc(COALESCE_BATCH_PAGES * sizeof(*chunk_rep_page));
-	chunk_group_offsets = xmalloc(COALESCE_BATCH_PAGES * sizeof(*chunk_group_offsets));
+	meta = xzalloc(COALESCE_BATCH_PAGES * sizeof(*meta));
+	offset_buffers[0] = xzalloc(COALESCE_BATCH_PAGES * sizeof(*offset_buffers[0]));
+	offset_buffers[1] = xzalloc(COALESCE_BATCH_PAGES * sizeof(*offset_buffers[1]));
+	blob_iov = xzalloc(COALESCE_BATCH_PAGES * sizeof(*blob_iov));
+	chunk_group_of_page = xzalloc(COALESCE_BATCH_PAGES * sizeof(*chunk_group_of_page));
+	chunk_rep_page = xzalloc(COALESCE_BATCH_PAGES * sizeof(*chunk_rep_page));
+	chunk_group_offsets = xzalloc(COALESCE_BATCH_PAGES * sizeof(*chunk_group_offsets));
 	chunk_groups_cap = next_power_of_two(COALESCE_BATCH_PAGES * 2);
-	chunk_groups = xmalloc(chunk_groups_cap * sizeof(*chunk_groups));
-	if (!meta || !offsets || !blob_iov || !chunk_group_of_page || !chunk_rep_page || !chunk_group_offsets || !chunk_groups)
+	chunk_groups = xzalloc(chunk_groups_cap * sizeof(*chunk_groups));
+	if (!meta || !offset_buffers[0] || !offset_buffers[1] || !blob_iov || !chunk_group_of_page || !chunk_rep_page ||
+	    !chunk_group_offsets || !chunk_groups)
 		goto out;
 
 	pagemap = open_image_at(dfd, target->pagemap_type, O_RSTR, target->img_id);
@@ -864,6 +870,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		unsigned int chunk_pages = schedule.pages[chunk_idx];
 		size_t chunk_bytes = (size_t)chunk_pages * PAGE_SIZE;
 		const char *chunk_pages_ptr = old_pages_map + source_off;
+		u64 *offsets = offset_buffers[current_offsets];
 		u64 lookup_start_us;
 		unsigned int j;
 		unsigned int nr_blob_pages = 0;
@@ -919,18 +926,36 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 			if (!meta[j].zero)
 				offsets[j] = chunk_group_offsets[chunk_group_of_page[j]];
 		}
+		for (j = 0; j < chunk_pages; j++) {
+			if (offsets[j] != PAGE_INDEX_ZERO && (offsets[j] & (PAGE_SIZE - 1))) {
+				pr_err("Non page-aligned compact page offset for image %u at page %u: %llu\n",
+				       pages_id, j, (unsigned long long)offsets[j]);
+				goto out;
+			}
+		}
 
 		if (nr_blob_pages > 0) {
 			if (blob_writer_wait(&writer))
 				goto out;
-			if (blob_writer_submit(&writer, blob_iov, nr_blob_pages))
-				goto out;
+		} else if (blob_writer_wait(&writer)) {
+			goto out;
 		}
 
-		step_start_us = now_us();
-		if (write_img_buf(index, offsets, chunk_pages * sizeof(*offsets)))
+		if (have_pending_index) {
+			step_start_us = now_us();
+			if (write_img_buf(index, offset_buffers[pending_offsets], pending_chunk_pages * sizeof(*offsets)))
+				goto out;
+			image_index_write_us += now_us() - step_start_us;
+			have_pending_index = false;
+		}
+
+		if (nr_blob_pages > 0 && blob_writer_submit(&writer, blob_iov, nr_blob_pages))
 			goto out;
-		image_index_write_us += now_us() - step_start_us;
+
+		pending_offsets = current_offsets;
+		pending_chunk_pages = chunk_pages;
+		have_pending_index = true;
+		current_offsets ^= 1U;
 
 		image_present_pages += chunk_pages;
 		source_off += chunk_bytes;
@@ -945,6 +970,12 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 
 	if (blob_writer_wait(&writer))
 		goto out;
+	if (have_pending_index) {
+		step_start_us = now_us();
+		if (write_img_buf(index, offset_buffers[pending_offsets], pending_chunk_pages * sizeof(*offset_buffers[pending_offsets])))
+			goto out;
+		image_index_write_us += now_us() - step_start_us;
+	}
 
 	snprintf(pages_path, sizeof(pages_path), imgset_template[CR_FD_PAGES].fmt, pages_id);
 
@@ -953,7 +984,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	image_total_us = now_us() - image_start_us;
 
 	stats->old_bytes += old_pages_size;
-	stats->index_bytes += image_present_pages * sizeof(*offsets);
+	stats->index_bytes += image_present_pages * sizeof(*offset_buffers[0]);
 	stats->present_pages += image_present_pages;
 	stats->zero_pages += image_zero_pages;
 	stats->unique_pages += image_unique_pages;
@@ -987,7 +1018,8 @@ out:
 	if (old_pages_mapped)
 		munmap((void *)old_pages_map, old_pages_size);
 	xfree(schedule.pages);
-	xfree(offsets);
+	xfree(offset_buffers[0]);
+	xfree(offset_buffers[1]);
 	xfree(meta);
 	xfree(blob_iov);
 	xfree(chunk_group_of_page);

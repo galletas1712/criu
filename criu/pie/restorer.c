@@ -2302,9 +2302,10 @@ __visible long __export_restore_task(struct task_restore_args *args)
 							cb->aio_data -= (__u64)events[k].res;
 							{
 								struct timeval submit0, submit1;
+								long ret2;
 
 								sys_gettimeofday(&submit0, NULL);
-								long ret2 = sys_io_submit(aio_ctx, 1, &cb);
+								ret2 = sys_io_submit(aio_ctx, 1, &cb);
 								sys_gettimeofday(&submit1, NULL);
 								aio_submit_us += timeval_delta_us(&submit0, &submit1);
 								if (ret2 != 1) {

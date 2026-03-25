@@ -106,7 +106,7 @@ static int pread_full(int fd, void *buf, size_t len, off_t off, unsigned int *sh
 	return 0;
 }
 
-static int copy_linear_to_iovecs(const void *src, const struct iovec *iov, unsigned int nr)
+static void copy_linear_to_iovecs(const void *src, const struct iovec *iov, unsigned int nr)
 {
 	const char *curr = src;
 	unsigned int i;
@@ -115,8 +115,6 @@ static int copy_linear_to_iovecs(const void *src, const struct iovec *iov, unsig
 		memcpy(iov[i].iov_base, curr, iov[i].iov_len);
 		curr += iov[i].iov_len;
 	}
-
-	return 0;
 }
 
 static void advance_iovecs(struct iovec **iov, unsigned int *nr, ssize_t len)
@@ -142,7 +140,6 @@ static int direct_read_iovecs(struct page_read *pr, int fd, off_t off, struct io
 	struct iovec *direct_iov = NULL;
 	struct iovec *direct_curr;
 	unsigned int direct_nr;
-	int ret;
 	bool aligned = direct_iovs_aligned(iov, nr, off);
 
 	pr->direct_pages += len / PAGE_SIZE;
@@ -158,11 +155,13 @@ static int direct_read_iovecs(struct page_read *pr, int fd, off_t off, struct io
 			return -1;
 		}
 
-		ret = pread_full(fd, aligned_buf, len, off, short_reads);
-		if (!ret)
-			ret = copy_linear_to_iovecs(aligned_buf, iov, nr);
+		if (pread_full(fd, aligned_buf, len, off, short_reads)) {
+			xfree(aligned_buf);
+			return -1;
+		}
+		copy_linear_to_iovecs(aligned_buf, iov, nr);
 		xfree(aligned_buf);
-		return ret;
+		return 0;
 	}
 
 	direct_iov = xmalloc(nr * sizeof(*direct_iov));
@@ -1621,6 +1620,14 @@ static int process_async_reads(struct page_read *pr)
 			max_iovs = piov->nr;
 		if (piov->nr_copies > max_copies)
 			max_copies = piov->nr_copies;
+		if (pr->use_direct) {
+			if (direct_read_iovecs(pr, fd, file_from, piov->to, piov->nr, remaining, &short_reads)) {
+				io_failed = true;
+			} else if (opts.auto_dedup && !pr->disable_dedup && punch_hole(pr, file_from, remaining, false)) {
+				io_failed = true;
+			}
+			goto read_done;
+		}
 	more:
 		bytes = preadv(fd, piov->to, piov->nr, file_from);
 		if (fault_injected(FI_PARTIAL_PAGES)) {
@@ -1662,6 +1669,7 @@ static int process_async_reads(struct page_read *pr)
 			remaining -= bytes;
 			goto more;
 		}
+read_done:
 
 		/*
 		 * On I/O failure drain all remaining async entries (current pr

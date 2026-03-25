@@ -1693,6 +1693,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	static unsigned ids = 1;
 	bool remote = pr_flags & PR_REMOTE;
 	bool try_direct_open = true;
+	bool pages_img_id_ready = false;
 
 	/*
 	 * Only the top-most page-read can be remote, all the
@@ -1749,8 +1750,22 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	}
 
 reopen_pages:
-	pr->pi = open_pages_image_at(dfd, flags | (try_direct_open ? O_TRY_DIRECT_OPEN : 0),
-				     pr->pmi, &pr->pages_img_id);
+	if (pr->pidx) {
+		close_image(pr->pidx);
+		pr->pidx = NULL;
+	}
+	if (!pages_img_id_ready) {
+		pr->pi = open_pages_image_at(dfd, flags | (try_direct_open ? O_TRY_DIRECT_OPEN : 0),
+					     pr->pmi, &pr->pages_img_id);
+		if (pr->pi && !empty_image(pr->pi))
+			pages_img_id_ready = true;
+	} else if (compact_pages_ready(dfd, pr->pages_img_id)) {
+		pr->pi = open_image_at(dfd, CR_FD_PAGES_BLOB,
+				       O_RSTR | (try_direct_open ? O_TRY_DIRECT_OPEN : 0));
+	} else {
+		pr->pi = open_image_at(dfd, CR_FD_PAGES,
+				       flags | (try_direct_open ? O_TRY_DIRECT_OPEN : 0), pr->pages_img_id);
+	}
 	if (!pr->pi || empty_image(pr->pi)) {
 		close_page_read(pr);
 		return -1;

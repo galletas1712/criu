@@ -378,7 +378,7 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 	aio_ctx_ready = true;
 
 	alloc_sz = aio_n * sizeof(*iocbs) + aio_n * sizeof(*iocbps) + COMPACT_AIO_BATCH * sizeof(*events);
-	iocbs = (void *)sys_mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	iocbs = mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (IS_ERR(iocbs)) {
 		pr_warn("Can't mmap compact AIO buffers: %ld\n", PTR_ERR(iocbs));
 		goto out;
@@ -390,7 +390,7 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 	for (i = 0; i < aio_n; i++)
 		iocbps[i] = &jobs[i].iocb;
 
-	sys_gettimeofday(&aio_tv0, NULL);
+	gettimeofday(&aio_tv0, NULL);
 	while (submitted < aio_n || completed < aio_n) {
 		while (submitted < aio_n && (submitted - completed) < COMPACT_AIO_BATCH) {
 			unsigned int batch = aio_n - submitted;
@@ -398,9 +398,9 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 			if (batch > COMPACT_AIO_BATCH - (submitted - completed))
 				batch = COMPACT_AIO_BATCH - (submitted - completed);
 
-			sys_gettimeofday(&stamp0, NULL);
+			gettimeofday(&stamp0, NULL);
 			ret = local_io_submit(aio_ctx, batch, &iocbps[submitted]);
-			sys_gettimeofday(&stamp1, NULL);
+			gettimeofday(&stamp1, NULL);
 			aio_submit_us += (unsigned long)timeval_delta_us(&stamp0, &stamp1);
 			if (ret <= 0) {
 				pr_warn("compact io_submit failed: %d (submitted %u/%u), falling back to buffered compact restore\n",
@@ -418,9 +418,9 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 			struct compact_aio_job *job;
 			long event_nr;
 
-			sys_gettimeofday(&stamp0, NULL);
+			gettimeofday(&stamp0, NULL);
 			event_nr = local_io_getevents(aio_ctx, 1, COMPACT_AIO_BATCH, events, NULL);
-			sys_gettimeofday(&stamp1, NULL);
+			gettimeofday(&stamp1, NULL);
 			aio_wait_us += (unsigned long)timeval_delta_us(&stamp0, &stamp1);
 			if (event_nr <= 0) {
 				pr_warn("compact io_getevents failed: %ld, falling back to buffered compact restore\n", event_nr);
@@ -473,9 +473,9 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 				job->iocb.aio_nbytes = nr_next;
 				job->iocb.aio_offset = job->file_from;
 				job->iocb.aio_data = job->remaining;
-				sys_gettimeofday(&stamp0, NULL);
+				gettimeofday(&stamp0, NULL);
 				ret = local_io_submit(aio_ctx, 1, &cb);
-				sys_gettimeofday(&stamp1, NULL);
+				gettimeofday(&stamp1, NULL);
 				aio_submit_us += (unsigned long)timeval_delta_us(&stamp0, &stamp1);
 				if (ret != 1) {
 					pr_warn("compact AIO retry submit failed: %d, falling back to buffered compact restore\n", ret);
@@ -488,9 +488,9 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 	}
 
 	ret = 0;
-	sys_gettimeofday(&aio_tv1, NULL);
+	gettimeofday(&aio_tv1, NULL);
 	local_io_destroy(aio_ctx);
-	sys_munmap(iocbs, alloc_sz);
+	munmap(iocbs, alloc_sz);
 	pr_info("pagemap async aio sort %lu ms merge %lu ms jobs %u->%u fadvise %lu ms aio %lu ms (submit %lu ms wait %lu ms, %u submits %u gets %u short %u resubmit, max inflight %u) zero-skip %zu MiB (%u ios) zero-fill %zu MiB (%u ios) copy %lu ms (%zu MiB, %u ios) read %zu MiB (%u ios, %u short, max %u iovs, max %u copies) (range %zu MiB)\n",
 		(unsigned long)(sort_us / 1000ULL), (unsigned long)(merge_us / 1000ULL), queue_jobs, merged_jobs,
 		fadv_ms,
@@ -516,7 +516,7 @@ out:
 	if (aio_ctx_ready)
 		local_io_destroy(aio_ctx);
 	if (iocbs_mapped)
-		sys_munmap(iocbs, alloc_sz);
+		munmap(iocbs, alloc_sz);
 	free_compact_aio_jobs(jobs, aio_n);
 	return 1;
 

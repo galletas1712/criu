@@ -2,6 +2,8 @@
 #define __CR_PAGE_XFER__H__
 #include "pagemap.h"
 
+struct compact_page_stream;
+
 struct ps_info {
 	int pid;
 	unsigned short port;
@@ -37,6 +39,7 @@ struct page_xfer {
 		struct /* local */ {
 			struct cr_img *pmi; /* pagemaps */
 			struct cr_img *pi;  /* pages */
+			struct compact_page_stream *compact;
 			int fd_type;
 			unsigned long img_id;
 		};

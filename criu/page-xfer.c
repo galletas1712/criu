@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <limits.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-xfer: "
@@ -258,6 +259,9 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	ssize_t ret;
 	ssize_t curr = 0;
 
+	if (xfer->compact)
+		return coalesce_checkpoint_pages_write_stream(xfer->compact, p, len);
+
 	while (1) {
 		ret = splice(p, NULL, img_raw_fd(xfer->pi), NULL, len - curr, SPLICE_F_MOVE);
 		if (ret == -1) {
@@ -274,6 +278,22 @@ static int write_pages_loc(struct page_xfer *xfer, int p, unsigned long len)
 	}
 
 	return 0;
+}
+
+static int unlink_raw_pages_image(u32 pages_id)
+{
+	char path[PATH_MAX];
+	int dfd = get_service_fd(IMG_FD_OFF);
+
+	if (dfd < 0)
+		return -1;
+
+	snprintf(path, sizeof(path), imgset_template[CR_FD_PAGES].fmt, pages_id);
+	if (!unlinkat(dfd, path, 0) || errno == ENOENT)
+		return 0;
+
+	pr_perror("Can't remove raw pages image %s", path);
+	return -1;
 }
 
 static int check_pagehole_in_parent(struct page_read *p, struct iovec *iov)
@@ -359,16 +379,23 @@ static void close_page_xfer(struct page_xfer *xfer)
 {
 	int fd_type = xfer->fd_type;
 	unsigned long img_id = xfer->img_id;
+	bool had_compact = xfer->compact != NULL;
 
 	if (xfer->parent != NULL) {
 		xfer->parent->close(xfer->parent);
 		xfree(xfer->parent);
 		xfer->parent = NULL;
 	}
-	close_image(xfer->pi);
+	if (xfer->compact) {
+		if (coalesce_checkpoint_pages_close_stream(xfer->compact))
+			pr_err("Can't finalize compact page stream for %d/%lu\n", fd_type, img_id);
+		xfer->compact = NULL;
+	} else if (xfer->pi) {
+		close_image(xfer->pi);
+	}
 	close_image(xfer->pmi);
 
-	if (!opts.use_page_server && opts.auto_dedup) {
+	if (!had_compact && !opts.use_page_server && opts.auto_dedup) {
 		if (coalesce_checkpoint_pages_enqueue(fd_type, img_id))
 			pr_err("Can't enqueue pagemap %d/%lu for online coalescing\n", fd_type, img_id);
 	}
@@ -385,6 +412,7 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	xfer->pi = open_pages_image(O_DUMP, xfer->pmi, &pages_id);
 	if (!xfer->pi)
 		goto err_pmi;
+	xfer->compact = NULL;
 
 	/*
 	 * Open page-read for parent images (if it exists). It will
@@ -426,6 +454,17 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	}
 
 out:
+	if (!opts.use_page_server && opts.auto_dedup) {
+		if (coalesce_checkpoint_pages_open_stream(pages_id, &xfer->compact))
+			goto err_pi;
+		if (xfer->compact) {
+			close_image(xfer->pi);
+			xfer->pi = NULL;
+			if (unlink_raw_pages_image(pages_id))
+				goto err_pi;
+		}
+	}
+
 	xfer->fd_type = fd_type;
 	xfer->img_id = img_id;
 	xfer->write_pagemap = write_pagemap_loc;
@@ -434,7 +473,12 @@ out:
 	return 0;
 
 err_pi:
-	close_image(xfer->pi);
+	if (xfer->compact) {
+		coalesce_checkpoint_pages_discard_stream(xfer->compact);
+		xfer->compact = NULL;
+	}
+	if (xfer->pi)
+		close_image(xfer->pi);
 err_pmi:
 	close_image(xfer->pmi);
 	return -1;

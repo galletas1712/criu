@@ -177,11 +177,39 @@ struct coalesce_worker_state {
 	bool failed;
 };
 
+struct compact_page_stream {
+	struct cr_img *index;
+	struct page_batch_meta *meta;
+	struct chunk_group_slot *chunk_groups;
+	unsigned int *chunk_group_of_page;
+	unsigned int *chunk_rep_page;
+	u64 *chunk_group_offsets;
+	u64 *offsets;
+	struct iovec *blob_iov;
+	char *pages_buf;
+	size_t chunk_groups_cap;
+	u32 pages_id;
+	u32 chunk_group_generation;
+	u64 present_pages;
+	u64 zero_pages;
+	u64 unique_pages;
+	u64 lookup_candidates;
+	u64 local_duplicate_pages;
+	u64 old_bytes;
+	u64 read_us;
+	u64 hash_us;
+	u64 lookup_us;
+	u64 blob_write_us;
+	u64 index_write_us;
+};
+
 /* One background worker consumes completed pagemap/pages pairs while dump continues. */
 static struct coalesce_worker_state online_state = {
 	.jobs = LIST_HEAD_INIT(online_state.jobs),
 	.compact.images = LIST_HEAD_INIT(online_state.compact.images),
 };
+
+static int should_run_page_coalesce(void);
 
 static u64 now_us(void)
 {
@@ -953,6 +981,8 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		goto out;
 	}
 
+	snprintf(index_path, sizeof(index_path), imgset_template[CR_FD_PAGE_INDEX].fmt, pages_id);
+
 	index = open_image_at(dfd, CR_FD_PAGE_INDEX, O_DUMP, pages_id);
 	if (!index)
 		goto out;
@@ -1092,8 +1122,6 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		image_index_write_us += now_us() - step_start_us;
 	}
 
-	snprintf(index_path, sizeof(index_path), imgset_template[CR_FD_PAGE_INDEX].fmt, pages_id);
-
 	store->blob_write_us += writer.write_us;
 	image_blob_write_us = writer.write_us;
 	image_total_us = now_us() - image_start_us;
@@ -1149,6 +1177,291 @@ out:
 		pr_perror("Can't remove partial compact page index %s", index_path);
 
 	return ret;
+}
+
+static int read_pipe_exact(int pipefd, void *buf, size_t len)
+{
+	size_t off = 0;
+
+	while (off < len) {
+		ssize_t ret = read(pipefd, (char *)buf + off, len - off);
+
+		if (ret < 0) {
+			if (errno == EINTR)
+				continue;
+			pr_perror("Can't read pages from dump pipe");
+			return -1;
+		}
+		if (ret == 0) {
+			pr_err("Dump pipe closed unexpectedly while streaming compact pages\n");
+			return -1;
+		}
+		off += ret;
+	}
+
+	return 0;
+}
+
+static void free_compact_page_stream(struct compact_page_stream *stream)
+{
+	if (!stream)
+		return;
+
+	if (stream->index)
+		close_image(stream->index);
+	xfree(stream->chunk_groups);
+	xfree(stream->pages_buf);
+	xfree(stream->chunk_group_offsets);
+	xfree(stream->chunk_rep_page);
+	xfree(stream->chunk_group_of_page);
+	xfree(stream->blob_iov);
+	xfree(stream->offsets);
+	xfree(stream->meta);
+	xfree(stream);
+}
+
+static int coalesce_stream_chunk_locked(struct compact_page_stream *stream, unsigned int chunk_pages)
+{
+	struct coalesce_worker_state *state = &online_state;
+	unsigned int nr_blob_pages = 0;
+	unsigned int group_count = 0;
+	unsigned int chunk_nonzero_pages = 0;
+	const char *pages = stream->pages_buf;
+	u64 lookup_start_us;
+	u64 step_start_us;
+	unsigned int j;
+
+	if (hash_pool_run(&state->pool, pages, stream->meta, chunk_pages, &stream->hash_us))
+		return -1;
+
+	if (!stream->chunk_group_generation) {
+		memzero(stream->chunk_groups, stream->chunk_groups_cap * sizeof(*stream->chunk_groups));
+		stream->chunk_group_generation = 1;
+	}
+
+	for (j = 0; j < chunk_pages; j++) {
+		unsigned int group_id;
+		bool is_new;
+
+		if (stream->meta[j].zero) {
+			stream->offsets[j] = PAGE_INDEX_ZERO;
+			stream->zero_pages++;
+			continue;
+		}
+
+		chunk_nonzero_pages++;
+		if (chunk_group_lookup_or_reserve(stream->chunk_groups, stream->chunk_groups_cap, stream->chunk_group_generation,
+						  &stream->meta[j].key, group_count, &group_id, &is_new))
+			return -1;
+		stream->chunk_group_of_page[j] = group_id;
+		if (is_new)
+			stream->chunk_rep_page[group_count++] = j;
+	}
+
+	lookup_start_us = now_us();
+	for (j = 0; j < group_count; j++) {
+		unsigned int rep = stream->chunk_rep_page[j];
+		bool is_new;
+
+		if (page_store_lookup_or_reserve(&state->store, &stream->meta[rep].key, &stream->chunk_group_offsets[j], &is_new))
+			return -1;
+		if (is_new) {
+			stream->blob_iov[nr_blob_pages].iov_base = (void *)(pages + rep * PAGE_SIZE);
+			stream->blob_iov[nr_blob_pages].iov_len = PAGE_SIZE;
+			nr_blob_pages++;
+			stream->unique_pages++;
+		}
+	}
+	stream->lookup_us += now_us() - lookup_start_us;
+	stream->lookup_candidates += group_count;
+	stream->local_duplicate_pages += chunk_nonzero_pages - group_count;
+
+	for (j = 0; j < chunk_pages; j++) {
+		if (!stream->meta[j].zero)
+			stream->offsets[j] = stream->chunk_group_offsets[stream->chunk_group_of_page[j]];
+	}
+
+	if (nr_blob_pages > 0) {
+		u64 blob_write_us;
+
+		step_start_us = now_us();
+		for (j = 0; j < nr_blob_pages;) {
+			unsigned int batch_iov = nr_blob_pages - j;
+			int written;
+
+			if (batch_iov > IOV_MAX)
+				batch_iov = IOV_MAX;
+
+			written = bwritev(&state->store.blob->_x, &stream->blob_iov[j], batch_iov);
+			if (written < 0) {
+				pr_perror("Can't write streamed coalesced page blob");
+				return -1;
+			}
+			if (written != (int)(batch_iov * PAGE_SIZE)) {
+				pr_err("Short write to streamed coalesced page blob: %d/%zu bytes\n", written,
+				       (size_t)batch_iov * PAGE_SIZE);
+				return -1;
+			}
+			j += batch_iov;
+		}
+		blob_write_us = now_us() - step_start_us;
+		stream->blob_write_us += blob_write_us;
+		state->store.blob_write_us += blob_write_us;
+	}
+
+	step_start_us = now_us();
+	if (write_img_buf(stream->index, stream->offsets, chunk_pages * sizeof(*stream->offsets)))
+		return -1;
+	stream->index_write_us += now_us() - step_start_us;
+
+	stream->present_pages += chunk_pages;
+	stream->old_bytes += (u64)chunk_pages * PAGE_SIZE;
+	stream->chunk_group_generation++;
+	return 0;
+}
+
+int coalesce_checkpoint_pages_open_stream(u32 pages_id, struct compact_page_stream **out)
+{
+	struct compact_page_stream *stream;
+
+	*out = NULL;
+	if (!should_run_page_coalesce() || !online_state.started)
+		return 0;
+
+	stream = xzalloc(sizeof(*stream));
+	if (!stream)
+		return -1;
+
+	stream->meta = xzalloc(COALESCE_BATCH_PAGES * sizeof(*stream->meta));
+	stream->offsets = xzalloc(COALESCE_BATCH_PAGES * sizeof(*stream->offsets));
+	stream->blob_iov = xzalloc(COALESCE_BATCH_PAGES * sizeof(*stream->blob_iov));
+	stream->chunk_group_of_page = xzalloc(COALESCE_BATCH_PAGES * sizeof(*stream->chunk_group_of_page));
+	stream->chunk_rep_page = xzalloc(COALESCE_BATCH_PAGES * sizeof(*stream->chunk_rep_page));
+	stream->chunk_group_offsets = xzalloc(COALESCE_BATCH_PAGES * sizeof(*stream->chunk_group_offsets));
+	stream->pages_buf = xzalloc((size_t)COALESCE_BATCH_PAGES * PAGE_SIZE);
+	stream->chunk_groups_cap = next_power_of_two(COALESCE_BATCH_PAGES * 2);
+	stream->chunk_groups = xzalloc(stream->chunk_groups_cap * sizeof(*stream->chunk_groups));
+	if (!stream->meta || !stream->offsets || !stream->blob_iov || !stream->chunk_group_of_page || !stream->chunk_rep_page ||
+	    !stream->chunk_group_offsets || !stream->pages_buf || !stream->chunk_groups)
+		goto err;
+
+	stream->index = open_image_at(online_state.dfd, CR_FD_PAGE_INDEX, O_DUMP, pages_id);
+	if (!stream->index)
+		goto err;
+
+	stream->pages_id = pages_id;
+	stream->chunk_group_generation = 1;
+	*out = stream;
+	return 0;
+
+err:
+	free_compact_page_stream(stream);
+	return -1;
+}
+
+int coalesce_checkpoint_pages_write_stream(struct compact_page_stream *stream, int pipefd, unsigned long len)
+{
+	u64 read_start_us = now_us();
+
+	if (!stream)
+		return 0;
+	if (len & (PAGE_SIZE - 1)) {
+		pr_err("Streamed compact pages length is not page aligned: %lu\n", len);
+		return -1;
+	}
+
+	while (len > 0) {
+		size_t chunk = len;
+		unsigned int chunk_pages;
+
+		if (chunk > (size_t)COALESCE_BATCH_PAGES * PAGE_SIZE)
+			chunk = (size_t)COALESCE_BATCH_PAGES * PAGE_SIZE;
+		chunk_pages = chunk / PAGE_SIZE;
+
+		if (read_pipe_exact(pipefd, stream->pages_buf, chunk))
+			return -1;
+
+		pthread_mutex_lock(&online_state.lock);
+		if (online_state.failed) {
+			pthread_mutex_unlock(&online_state.lock);
+			return -1;
+		}
+		if (coalesce_stream_chunk_locked(stream, chunk_pages)) {
+			online_state.failed = true;
+			pthread_mutex_unlock(&online_state.lock);
+			return -1;
+		}
+		pthread_mutex_unlock(&online_state.lock);
+		len -= chunk;
+	}
+
+	stream->read_us += now_us() - read_start_us;
+	return 0;
+}
+
+int coalesce_checkpoint_pages_close_stream(struct compact_page_stream *stream)
+{
+	char index_path[PATH_MAX] = {};
+	int ret = 0;
+
+	if (!stream)
+		return 0;
+
+	snprintf(index_path, sizeof(index_path), imgset_template[CR_FD_PAGE_INDEX].fmt, stream->pages_id);
+
+	pthread_mutex_lock(&online_state.lock);
+	if (!online_state.failed) {
+		if (compact_image_set_add(&online_state.compact, stream->pages_id)) {
+			online_state.failed = true;
+			ret = -1;
+		} else {
+			online_state.stats.old_bytes += stream->old_bytes;
+			online_state.stats.blob_bytes = online_state.store.next_offset;
+			online_state.stats.index_bytes += stream->present_pages * sizeof(*stream->offsets);
+			online_state.stats.present_pages += stream->present_pages;
+			online_state.stats.zero_pages += stream->zero_pages;
+			online_state.stats.unique_pages += stream->unique_pages;
+			online_state.stats.lookup_candidates += stream->lookup_candidates;
+			online_state.stats.local_duplicate_pages += stream->local_duplicate_pages;
+			online_state.stats.images++;
+			online_state.stats.read_us += stream->read_us;
+			online_state.stats.hash_us += stream->hash_us;
+			online_state.stats.lookup_us += stream->lookup_us;
+			online_state.stats.index_write_us += stream->index_write_us;
+			online_state.stats.blob_write_us = online_state.store.blob_write_us;
+		}
+	} else {
+		ret = -1;
+	}
+	pthread_mutex_unlock(&online_state.lock);
+
+	pr_info("Image %u coalesced inline: present=%llu unique=%llu local_unique=%llu local_dup=%llu zero=%llu read=%llu ms hash=%llu ms lookup=%llu ms blob=%llu ms index=%llu ms\n",
+		stream->pages_id, (unsigned long long)stream->present_pages, (unsigned long long)stream->unique_pages,
+		(unsigned long long)stream->lookup_candidates, (unsigned long long)stream->local_duplicate_pages,
+		(unsigned long long)stream->zero_pages, (unsigned long long)(stream->read_us / 1000ULL),
+		(unsigned long long)(stream->hash_us / 1000ULL), (unsigned long long)(stream->lookup_us / 1000ULL),
+		(unsigned long long)(stream->blob_write_us / 1000ULL), (unsigned long long)(stream->index_write_us / 1000ULL));
+
+	free_compact_page_stream(stream);
+
+	if (ret != 0 && index_path[0] && unlinkat(online_state.dfd, index_path, 0) && errno != ENOENT)
+		pr_perror("Can't remove partial compact page index %s", index_path);
+
+	return ret;
+}
+
+void coalesce_checkpoint_pages_discard_stream(struct compact_page_stream *stream)
+{
+	char index_path[PATH_MAX] = {};
+
+	if (!stream)
+		return;
+
+	snprintf(index_path, sizeof(index_path), imgset_template[CR_FD_PAGE_INDEX].fmt, stream->pages_id);
+	free_compact_page_stream(stream);
+
+	if (index_path[0] && unlinkat(online_state.dfd, index_path, 0) && errno != ENOENT)
+		pr_perror("Can't remove discarded compact page index %s", index_path);
 }
 
 static int should_run_page_coalesce(void)
@@ -1208,7 +1521,8 @@ static void coalesce_worker_destroy(struct coalesce_worker_state *state)
 		xfree(job);
 	}
 
-	close_image(state->store.blob);
+	if (state->store.blob)
+		close_image(state->store.blob);
 	hash_pool_fini(&state->pool);
 	xfree(state->store.slots);
 	compact_image_set_fini(&state->compact);
@@ -1345,8 +1659,14 @@ static int coalesce_checkpoint_pages_finish_online(void)
 	pthread_join(online_state.thread, NULL);
 	if (online_state.failed)
 		ret = -1;
-	else if (publish_compact_sidecars(online_state.dfd, &online_state.compact))
-		ret = -1;
+	else {
+		if (online_state.store.blob) {
+			close_image(online_state.store.blob);
+			online_state.store.blob = NULL;
+		}
+		if (publish_compact_sidecars(online_state.dfd, &online_state.compact))
+			ret = -1;
+	}
 
 	if (!ret) {
 		online_state.stats.total_us = online_state.stats.read_us + online_state.stats.hash_us + online_state.stats.lookup_us +

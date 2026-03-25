@@ -484,27 +484,35 @@ static int drain_xfer_pages_pipelined(struct page_pipe *pp, struct parasite_ctl 
 
 	timing_start(TIME_MEMWRITE);
 	list_for_each_entry(ppb, &pp->bufs, l) {
+		u64 drain_start_us;
 		u64 step_start_us = mem_now_us();
 
 		args->nr_segs = ppb->nr_segs;
 		args->nr_pages = ppb->pages_in;
 		pr_debug("PPB: %ld pages %d segs %u pipe %d off\n", args->nr_pages, args->nr_segs, ppb->pipe_size, args->off);
 
-		if (compel_rpc_call(PARASITE_CMD_DUMPPAGES, ctl) < 0)
-			goto out_thread;
-		if (compel_util_send_fd(ctl, ppb->p[1]))
-			goto out_thread;
-		if (compel_rpc_sync(PARASITE_CMD_DUMPPAGES, ctl) < 0)
-			goto out_thread;
-
-		pipe.drain_us += mem_now_us() - step_start_us;
-		args->off += args->nr_segs;
-
-		step_start_us = mem_now_us();
 		pthread_mutex_lock(&pipe.lock);
 		while (pipe.nr_ready == NR_PIPES_PER_CHUNK && !pipe.failed)
 			pthread_cond_wait(&pipe.space, &pipe.lock);
 		pipe.enqueue_wait_us += mem_now_us() - step_start_us;
+		if (pipe.failed) {
+			pthread_mutex_unlock(&pipe.lock);
+			goto out_thread;
+		}
+		pthread_mutex_unlock(&pipe.lock);
+
+		drain_start_us = mem_now_us();
+		if (compel_rpc_call(PARASITE_CMD_DUMPPAGES, ctl) < 0)
+			goto out_thread;
+		if (compel_util_send_fd(ctl, ppb->p[1]))
+			goto out_thread;
+
+		/*
+		 * Publish the buffer before waiting for the parasite sync so the
+		 * xfer thread can start consuming the same ppb while the parasite
+		 * finishes dumping it.
+		 */
+		pthread_mutex_lock(&pipe.lock);
 		if (pipe.failed) {
 			pthread_mutex_unlock(&pipe.lock);
 			goto out_thread;
@@ -514,6 +522,11 @@ static int drain_xfer_pages_pipelined(struct page_pipe *pp, struct parasite_ctl 
 		pipe.nr_ready++;
 		pthread_cond_signal(&pipe.ready);
 		pthread_mutex_unlock(&pipe.lock);
+
+		if (compel_rpc_sync(PARASITE_CMD_DUMPPAGES, ctl) < 0)
+			goto out_thread;
+		pipe.drain_us += mem_now_us() - drain_start_us;
+		args->off += args->nr_segs;
 	}
 
 	ret = 0;

@@ -1,6 +1,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/syscall.h>
@@ -1555,13 +1556,16 @@ static int memfd_open_parallel(struct open_vma_unique *unique, int nr_unique)
 	pthread_t workers[OPEN_VMAS_MEMFD_WORKERS_MAX];
 	long cpus;
 	int nr_jobs, nr_workers, i;
+	struct timeval tv0, tv1;
 
 	nr_jobs = memfd_open_jobs_collect(unique, nr_unique, &jobs);
 	if (nr_jobs < 0)
 		return -1;
 	if (nr_jobs <= 1) {
 		int ret = 0;
+		struct timeval tv0, tv1;
 
+		gettimeofday(&tv0, NULL);
 		if (nr_jobs == 1) {
 			int fd;
 
@@ -1574,6 +1578,10 @@ static int memfd_open_parallel(struct open_vma_unique *unique, int nr_unique)
 		}
 
 		xfree(jobs);
+		gettimeofday(&tv1, NULL);
+		if (nr_jobs == 1)
+			pr_info("open_vmas: restored %d unique memfd inode with 1 worker in %lu ms\n", nr_jobs,
+				(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000));
 		return ret;
 	}
 
@@ -1584,7 +1592,9 @@ static int memfd_open_parallel(struct open_vma_unique *unique, int nr_unique)
 	nr_workers = min_t(int, nr_workers, OPEN_VMAS_MEMFD_WORKERS_MAX);
 	if (nr_workers < 2) {
 		int ret = 0;
+		struct timeval tv0, tv1;
 
+		gettimeofday(&tv0, NULL);
 		for (i = 0; i < nr_jobs; i++) {
 			int fd;
 
@@ -1598,9 +1608,13 @@ static int memfd_open_parallel(struct open_vma_unique *unique, int nr_unique)
 		}
 
 		xfree(jobs);
+		gettimeofday(&tv1, NULL);
+		pr_info("open_vmas: restored %d unique memfd inodes with 1 worker in %lu ms\n", nr_jobs,
+			(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000));
 		return ret;
 	}
 
+	gettimeofday(&tv0, NULL);
 	memzero(&plan, sizeof(plan));
 	plan.jobs = jobs;
 	plan.nr_jobs = nr_jobs;
@@ -1641,6 +1655,9 @@ static int memfd_open_parallel(struct open_vma_unique *unique, int nr_unique)
 
 	pthread_mutex_destroy(&plan.lock);
 	xfree(jobs);
+	gettimeofday(&tv1, NULL);
+	pr_info("open_vmas: restored %d unique memfd inodes with %d workers in %lu ms\n", nr_jobs, nr_workers,
+		(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000));
 	return plan.ret;
 }
 
@@ -1824,6 +1841,8 @@ out:
 static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 {
 	struct cr_img *pages;
+	struct cr_img *index;
+	bool compact;
 
 	/*
 	 * We optimize the case when rsti(t)->vma_io is empty.
@@ -1839,13 +1858,29 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 		return 0;
 	}
 
+	index = open_image(CR_FD_PAGE_INDEX, O_RSTR, rsti(t)->pages_img_id);
+	if (!index)
+		return -1;
+
+	compact = !empty_image(index);
+	close_image(index);
+
 	/*
 	 * If auto-dedup is on we need RDWR mode to be able to punch holes in
 	 * the input files (in restorer.c)
 	 */
-	pages = open_image(CR_FD_PAGES, opts.auto_dedup ? O_RDWR : O_RSTR, rsti(t)->pages_img_id);
+	if (compact)
+		pages = open_image(CR_FD_PAGES_BLOB, O_RSTR);
+	else
+		pages = open_image(CR_FD_PAGES, opts.auto_dedup ? O_RDWR : O_RSTR, rsti(t)->pages_img_id);
 	if (!pages)
 		return -1;
+	if (empty_image(pages)) {
+		pr_err("No pages image available for pages_id %u%s\n", rsti(t)->pages_img_id,
+		       compact ? " (expected compact blob)" : "");
+		close_image(pages);
+		return -1;
+	}
 
 	ta->vma_ios_fd = img_raw_fd(pages);
 	if (ta->vma_ios_fd >= 0) {

@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -527,10 +528,12 @@ static int restore_memfd_shmem_content_ex(int fd, unsigned long shmid, unsigned 
 	unsigned long aligned_size = round_up(size, PAGE_SIZE);
 	int ret = 0;
 	struct page_read pr;
+	struct timeval tv0, tv1;
 
 	if (!size)
 		return 0;
 
+	gettimeofday(&tv0, NULL);
 	ret = open_page_read(shmid, &pr, PR_SHMEM);
 	if (ret < 0)
 		return -1;
@@ -555,6 +558,10 @@ static int restore_memfd_shmem_content_ex(int fd, unsigned long shmid, unsigned 
 
 	if (munmap(addr, size))
 		pr_perror("munmap failed for shmem 0x%lx", shmid);
+
+	gettimeofday(&tv1, NULL);
+	pr_info("memfd shmem restore 0x%lx size=%lu took %lu ms\n", shmid, size,
+		(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000));
 
 	return ret;
 }

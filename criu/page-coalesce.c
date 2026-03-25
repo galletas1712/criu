@@ -148,11 +148,21 @@ struct coalesce_job {
 	unsigned long img_id;
 };
 
+struct compact_image {
+	struct list_head list;
+	u32 pages_id;
+};
+
+struct compact_image_set {
+	struct list_head images;
+};
+
 struct coalesce_worker_state {
 	pthread_t thread;
 	pthread_mutex_t lock;
 	pthread_cond_t ready;
 	struct list_head jobs;
+	struct compact_image_set compact;
 	struct hash_pool pool;
 	struct page_store store;
 	struct coalesce_stats stats;
@@ -165,6 +175,7 @@ struct coalesce_worker_state {
 /* One background worker consumes completed pagemap/pages pairs while dump continues. */
 static struct coalesce_worker_state online_state = {
 	.jobs = LIST_HEAD_INIT(online_state.jobs),
+	.compact.images = LIST_HEAD_INIT(online_state.compact.images),
 };
 
 static u64 now_us(void)
@@ -781,10 +792,75 @@ static int collect_page_targets(int dfd, struct page_target **targets, size_t *n
 	return 0;
 }
 
-static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_store *store, const struct page_target *target,
-				struct coalesce_stats *stats)
+static void compact_image_set_init(struct compact_image_set *set)
 {
-	char pages_path[PATH_MAX] = {};
+	INIT_LIST_HEAD(&set->images);
+}
+
+static void compact_image_set_fini(struct compact_image_set *set)
+{
+	struct compact_image *image, *tmp;
+
+	list_for_each_entry_safe(image, tmp, &set->images, list) {
+		list_del(&image->list);
+		xfree(image);
+	}
+}
+
+static int compact_image_set_add(struct compact_image_set *set, u32 pages_id)
+{
+	struct compact_image *image = xmalloc(sizeof(*image));
+
+	if (!image)
+		return -1;
+
+	image->pages_id = pages_id;
+	list_add_tail(&image->list, &set->images);
+	return 0;
+}
+
+static int unlink_image_file(int dfd, int type, u32 pages_id)
+{
+	char path[PATH_MAX];
+
+	snprintf(path, sizeof(path), imgset_template[type].fmt, pages_id);
+	if (!unlinkat(dfd, path, 0))
+		return 0;
+	if (errno == ENOENT)
+		return 0;
+
+	pr_perror("Can't remove image file %s", path);
+	return -1;
+}
+
+static void cleanup_compact_sidecars(int dfd, struct compact_image_set *set)
+{
+	struct compact_image *image;
+
+	(void)clear_compact_pages_commit(dfd);
+	(void)unlinkat(dfd, imgset_template[CR_FD_PAGES_BLOB].fmt, 0);
+	list_for_each_entry(image, &set->images, list)
+		(void)unlink_image_file(dfd, CR_FD_PAGE_INDEX, image->pages_id);
+}
+
+static int publish_compact_sidecars(int dfd, struct compact_image_set *set)
+{
+	struct compact_image *image;
+
+	if (mark_compact_pages_commit(dfd))
+		return -1;
+
+	list_for_each_entry(image, &set->images, list) {
+		if (unlink_image_file(dfd, CR_FD_PAGES, image->pages_id))
+			pr_warn("Keeping raw pages-%u.img after compact commit\n", image->pages_id);
+	}
+
+	return 0;
+}
+
+static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_store *store, struct compact_image_set *compact,
+				const struct page_target *target, struct coalesce_stats *stats)
+{
 	char index_path[PATH_MAX] = {};
 	struct page_batch_meta *meta = NULL;
 	struct chunk_group_slot *chunk_groups = NULL;
@@ -844,17 +920,12 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		goto out;
 	}
 
-	{
-		PagemapHead *h;
-
-		if (pb_read_one(pagemap, &h, PB_PAGEMAP_HEAD) < 0)
-			goto out;
-		pages_id = h->pages_id;
-		pagemap_head__free_unpacked(h, NULL);
-	}
-
-	old_pages = open_image_at(dfd, CR_FD_PAGES, O_RSTR, pages_id);
+	old_pages = open_raw_pages_image_at(dfd, O_RSTR, pagemap, &pages_id);
 	if (!old_pages || empty_image(old_pages)) {
+		if (compact_pages_committed(dfd, pages_id)) {
+			ret = 0;
+			goto out;
+		}
 		pr_err("Missing pages image for id %u\n", pages_id);
 		goto out;
 	}
@@ -998,7 +1069,6 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		image_index_write_us += now_us() - step_start_us;
 	}
 
-	snprintf(pages_path, sizeof(pages_path), imgset_template[CR_FD_PAGES].fmt, pages_id);
 	snprintf(index_path, sizeof(index_path), imgset_template[CR_FD_PAGE_INDEX].fmt, pages_id);
 
 	store->blob_write_us += writer.write_us;
@@ -1028,6 +1098,9 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		(unsigned long long)(image_lookup_us / 1000ULL), (unsigned long long)(image_blob_write_us / 1000ULL),
 		(unsigned long long)(image_index_write_us / 1000ULL));
 
+	if (compact_image_set_add(compact, pages_id))
+		goto out;
+
 	ret = 0;
 out:
 	blob_writer_fini(&writer);
@@ -1049,11 +1122,7 @@ out:
 	xfree(chunk_group_offsets);
 	xfree(chunk_groups);
 
-	if (ret == 0 && unlinkat(dfd, pages_path, 0)) {
-		pr_perror("Can't remove original pages image %s", pages_path);
-		ret = -1;
-	}
-	if (ret != 0 && unlinkat(dfd, index_path, 0) && errno != ENOENT)
+	if (ret != 0 && index_path[0] && unlinkat(dfd, index_path, 0) && errno != ENOENT)
 		pr_perror("Can't remove partial compact page index %s", index_path);
 
 	return ret;
@@ -1076,6 +1145,7 @@ static int coalesce_worker_init(struct coalesce_worker_state *state)
 {
 	memzero(state, sizeof(*state));
 	INIT_LIST_HEAD(&state->jobs);
+	compact_image_set_init(&state->compact);
 
 	state->dfd = get_service_fd(IMG_FD_OFF);
 	if (state->dfd < 0) {
@@ -1085,6 +1155,11 @@ static int coalesce_worker_init(struct coalesce_worker_state *state)
 
 	if (hash_pool_init(&state->pool))
 		return -1;
+
+	if (clear_compact_pages_commit(state->dfd)) {
+		hash_pool_fini(&state->pool);
+		return -1;
+	}
 
 	state->store.blob = open_image_at(state->dfd, CR_FD_PAGES_BLOB, O_RDWR | O_CREAT | O_TRUNC);
 	if (!state->store.blob) {
@@ -1113,10 +1188,12 @@ static void coalesce_worker_destroy(struct coalesce_worker_state *state)
 	close_image(state->store.blob);
 	hash_pool_fini(&state->pool);
 	xfree(state->store.slots);
+	compact_image_set_fini(&state->compact);
 	pthread_cond_destroy(&state->ready);
 	pthread_mutex_destroy(&state->lock);
 	memzero(state, sizeof(*state));
 	INIT_LIST_HEAD(&state->jobs);
+	compact_image_set_init(&state->compact);
 }
 
 static void *coalesce_worker_main(void *arg)
@@ -1142,7 +1219,7 @@ static void *coalesce_worker_main(void *arg)
 
 		target.pagemap_type = job->pagemap_type;
 		target.img_id = job->img_id;
-		if (coalesce_one_pagemap(state->dfd, &state->pool, &state->store, &target, &state->stats)) {
+		if (coalesce_one_pagemap(state->dfd, &state->pool, &state->store, &state->compact, &target, &state->stats)) {
 			pthread_mutex_lock(&state->lock);
 			state->failed = true;
 			state->stop = true;
@@ -1229,6 +1306,7 @@ void coalesce_checkpoint_pages_abort(void)
 	pthread_mutex_unlock(&online_state.lock);
 
 	pthread_join(online_state.thread, NULL);
+	cleanup_compact_sidecars(online_state.dfd, &online_state.compact);
 	coalesce_worker_destroy(&online_state);
 }
 
@@ -1243,6 +1321,8 @@ static int coalesce_checkpoint_pages_finish_online(void)
 
 	pthread_join(online_state.thread, NULL);
 	if (online_state.failed)
+		ret = -1;
+	else if (publish_compact_sidecars(online_state.dfd, &online_state.compact))
 		ret = -1;
 
 	if (!ret) {
@@ -1275,6 +1355,8 @@ static int coalesce_checkpoint_pages_finish_online(void)
 			(unsigned long long)(online_state.store.cap ? (online_state.store.used * 100ULL / online_state.store.cap) : 0),
 			online_state.pool.nr_threads, COALESCE_BATCH_PAGES);
 	}
+	if (ret)
+		cleanup_compact_sidecars(online_state.dfd, &online_state.compact);
 
 	coalesce_worker_destroy(&online_state);
 	return ret;
@@ -1285,6 +1367,7 @@ static int coalesce_checkpoint_pages_postpass(void)
 	struct hash_pool pool;
 	struct page_store store = {};
 	struct coalesce_stats stats = {};
+	struct compact_image_set compact;
 	struct page_target *targets = NULL;
 	size_t i;
 	size_t nr_targets = 0;
@@ -1307,9 +1390,18 @@ static int coalesce_checkpoint_pages_postpass(void)
 		xfree(targets);
 		return 0;
 	}
+	compact_image_set_init(&compact);
 
 	if (hash_pool_init(&pool)) {
 		xfree(targets);
+		compact_image_set_fini(&compact);
+		return -1;
+	}
+
+	if (clear_compact_pages_commit(dfd)) {
+		hash_pool_fini(&pool);
+		xfree(targets);
+		compact_image_set_fini(&compact);
 		return -1;
 	}
 
@@ -1317,12 +1409,13 @@ static int coalesce_checkpoint_pages_postpass(void)
 	if (!store.blob) {
 		hash_pool_fini(&pool);
 		xfree(targets);
+		compact_image_set_fini(&compact);
 		return -1;
 	}
 
 	start_us = now_us();
 	for (i = 0; i < nr_targets; i++) {
-		if (coalesce_one_pagemap(dfd, &pool, &store, &targets[i], &stats)) {
+		if (coalesce_one_pagemap(dfd, &pool, &store, &compact, &targets[i], &stats)) {
 			ret = -1;
 			break;
 		}
@@ -1336,6 +1429,11 @@ static int coalesce_checkpoint_pages_postpass(void)
 	xfree(store.slots);
 	xfree(targets);
 
+	if (!ret && publish_compact_sidecars(dfd, &compact))
+		ret = -1;
+	if (ret)
+		cleanup_compact_sidecars(dfd, &compact);
+	compact_image_set_fini(&compact);
 	if (ret)
 		return ret;
 

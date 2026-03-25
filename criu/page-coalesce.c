@@ -227,6 +227,24 @@ static void compute_page_hash_key(const void *page, struct page_hash_key *out, b
 		return;
 	}
 
+	/* Unroll the hot hash loop so non-zero pages spend less time in per-word loop overhead. */
+	while (words + 4 <= end) {
+		u64 w0 = words[0];
+		u64 w1 = words[1];
+		u64 w2 = words[2];
+		u64 w3 = words[3];
+
+		h0 = page_hash_step(h0, w0, 0x9e3779b97f4a7c15ULL, 0xc2b2ae3d27d4eb4fULL);
+		h1 = page_hash_step(h1, rotl64(w0, 17), 0x94d049bb133111ebULL, 0x165667b19e3779f9ULL);
+		h0 = page_hash_step(h0, w1, 0x9e3779b97f4a7c15ULL, 0xc2b2ae3d27d4eb4fULL);
+		h1 = page_hash_step(h1, rotl64(w1, 17), 0x94d049bb133111ebULL, 0x165667b19e3779f9ULL);
+		h0 = page_hash_step(h0, w2, 0x9e3779b97f4a7c15ULL, 0xc2b2ae3d27d4eb4fULL);
+		h1 = page_hash_step(h1, rotl64(w2, 17), 0x94d049bb133111ebULL, 0x165667b19e3779f9ULL);
+		h0 = page_hash_step(h0, w3, 0x9e3779b97f4a7c15ULL, 0xc2b2ae3d27d4eb4fULL);
+		h1 = page_hash_step(h1, rotl64(w3, 17), 0x94d049bb133111ebULL, 0x165667b19e3779f9ULL);
+		words += 4;
+	}
+
 	while (words < end) {
 		u64 word = *words++;
 

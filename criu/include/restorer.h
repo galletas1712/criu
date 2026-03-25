@@ -135,11 +135,23 @@ typedef long (*thread_restore_fcall_t)(struct thread_restore_args *args);
 
 struct restore_vma_io {
 	int nr_iovs;
+	int nr_copies;
 	loff_t off;
 	struct iovec iovs[0];
 };
 
-#define RIO_SIZE(niovs) (sizeof(struct restore_vma_io) + (niovs) * sizeof(struct iovec))
+struct restore_vma_copy {
+	void *src;
+	void *dst;
+};
+
+static inline struct restore_vma_copy *restore_vma_io_copies(struct restore_vma_io *rio)
+{
+	return (struct restore_vma_copy *)&rio->iovs[rio->nr_iovs];
+}
+
+#define RIO_SIZE(niovs, ncopies) \
+	(sizeof(struct restore_vma_io) + (niovs) * sizeof(struct iovec) + (ncopies) * sizeof(struct restore_vma_copy))
 
 struct task_restore_args {
 	struct thread_restore_args *t; /* thread group leader */

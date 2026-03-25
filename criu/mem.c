@@ -525,6 +525,12 @@ static int drain_xfer_pages_pipelined(struct page_pipe *pp, struct parasite_ctl 
 
 		if (compel_rpc_sync(PARASITE_CMD_DUMPPAGES, ctl) < 0)
 			goto out_thread;
+		pthread_mutex_lock(&pipe.lock);
+		if (pipe.failed) {
+			pthread_mutex_unlock(&pipe.lock);
+			goto out_thread;
+		}
+		pthread_mutex_unlock(&pipe.lock);
 		pipe.drain_us += mem_now_us() - drain_start_us;
 		args->off += args->nr_segs;
 	}

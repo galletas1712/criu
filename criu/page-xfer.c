@@ -939,39 +939,50 @@ err:
 
 int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
-	struct page_pipe_buf *ppb;
 	unsigned int cur_hole = 0;
-	int ret;
 
 	pr_debug("Transferring pages:\n");
 
+	struct page_pipe_buf *ppb;
+
 	list_for_each_entry(ppb, &pp->bufs, l) {
-		unsigned int i;
-
-		pr_debug("\tbuf %lx/%d\n", ppb->pages_in, ppb->nr_segs);
-
-		for (i = 0; i < ppb->nr_segs; i++) {
-			struct iovec iov = ppb->iov[i];
-			u32 flags;
-
-			ret = dump_holes(xfer, pp, &cur_hole, iov.iov_base);
-			if (ret)
-				return ret;
-
-			BUG_ON(iov.iov_base < (void *)xfer->offset);
-			iov.iov_base -= xfer->offset;
-			pr_debug("\tp %p - %p\n", iov.iov_base, iov.iov_base + iov.iov_len);
-
-			flags = ppb_xfer_flags(xfer, ppb);
-
-			if (xfer->write_pagemap(xfer, &iov, flags))
-				return -1;
-			if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
-				return -1;
-		}
+		if (page_xfer_dump_pages_ppb(xfer, pp, ppb, &cur_hole))
+			return -1;
 	}
 
-	return dump_holes(xfer, pp, &cur_hole, NULL);
+	return page_xfer_dump_pages_finish(xfer, pp, &cur_hole);
+}
+
+int page_xfer_dump_pages_ppb(struct page_xfer *xfer, struct page_pipe *pp, struct page_pipe_buf *ppb, unsigned int *cur_hole)
+{
+	unsigned int i;
+
+	pr_debug("\tbuf %lx/%d\n", ppb->pages_in, ppb->nr_segs);
+
+	for (i = 0; i < ppb->nr_segs; i++) {
+		struct iovec iov = ppb->iov[i];
+		u32 flags;
+
+		if (dump_holes(xfer, pp, cur_hole, iov.iov_base))
+			return -1;
+
+		BUG_ON(iov.iov_base < (void *)xfer->offset);
+		iov.iov_base -= xfer->offset;
+		pr_debug("\tp %p - %p\n", iov.iov_base, iov.iov_base + iov.iov_len);
+
+		flags = ppb_xfer_flags(xfer, ppb);
+		if (xfer->write_pagemap(xfer, &iov, flags))
+			return -1;
+		if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
+			return -1;
+	}
+
+	return 0;
+}
+
+int page_xfer_dump_pages_finish(struct page_xfer *xfer, struct page_pipe *pp, unsigned int *cur_hole)
+{
+	return dump_holes(xfer, pp, cur_hole, NULL);
 }
 
 /*

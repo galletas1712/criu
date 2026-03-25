@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <stdio.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <errno.h>
@@ -380,6 +381,174 @@ static int xfer_pages(struct page_pipe *pp, struct page_xfer *xfer)
 	return ret;
 }
 
+struct dump_xfer_pipeline {
+	struct page_pipe *pp;
+	struct page_xfer *xfer;
+	pthread_t thread;
+	pthread_mutex_t lock;
+	pthread_cond_t ready;
+	pthread_cond_t space;
+	struct page_pipe_buf *queue[NR_PIPES_PER_CHUNK];
+	unsigned int cur_hole;
+	unsigned int head;
+	unsigned int tail;
+	unsigned int nr_ready;
+	bool stop;
+	bool failed;
+	u64 start_us;
+	u64 drain_us;
+	u64 enqueue_wait_us;
+	u64 consumer_wait_us;
+	u64 xfer_us;
+};
+
+static u64 mem_now_us(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return (u64)tv.tv_sec * 1000000ULL + (u64)tv.tv_usec;
+}
+
+static void *dump_xfer_pipeline_main(void *arg)
+{
+	struct dump_xfer_pipeline *pipe = arg;
+
+	for (;;) {
+		struct page_pipe_buf *ppb;
+		u64 step_start_us;
+
+		step_start_us = mem_now_us();
+		pthread_mutex_lock(&pipe->lock);
+		while (pipe->nr_ready == 0 && !pipe->stop && !pipe->failed)
+			pthread_cond_wait(&pipe->ready, &pipe->lock);
+		pipe->consumer_wait_us += mem_now_us() - step_start_us;
+
+		if (pipe->failed || (pipe->stop && pipe->nr_ready == 0)) {
+			pthread_mutex_unlock(&pipe->lock);
+			break;
+		}
+
+		ppb = pipe->queue[pipe->head];
+		pipe->head = (pipe->head + 1) % NR_PIPES_PER_CHUNK;
+		pipe->nr_ready--;
+		pthread_cond_signal(&pipe->space);
+		pthread_mutex_unlock(&pipe->lock);
+
+		step_start_us = mem_now_us();
+		if (page_xfer_dump_pages_ppb(pipe->xfer, pipe->pp, ppb, &pipe->cur_hole)) {
+			pthread_mutex_lock(&pipe->lock);
+			pipe->failed = true;
+			pthread_cond_broadcast(&pipe->space);
+			pthread_cond_broadcast(&pipe->ready);
+			pthread_mutex_unlock(&pipe->lock);
+			return NULL;
+		}
+		pipe->xfer_us += mem_now_us() - step_start_us;
+	}
+
+	if (!pipe->failed) {
+		u64 step_start_us = mem_now_us();
+
+		if (page_xfer_dump_pages_finish(pipe->xfer, pipe->pp, &pipe->cur_hole)) {
+			pthread_mutex_lock(&pipe->lock);
+			pipe->failed = true;
+			pthread_mutex_unlock(&pipe->lock);
+			return NULL;
+		}
+		pipe->xfer_us += mem_now_us() - step_start_us;
+	}
+
+	return NULL;
+}
+
+static int drain_xfer_pages_pipelined(struct page_pipe *pp, struct parasite_ctl *ctl, struct parasite_dump_pages_args *args,
+				      struct page_xfer *xfer)
+{
+	struct dump_xfer_pipeline pipe = {
+		.pp = pp,
+		.xfer = xfer,
+		.start_us = mem_now_us(),
+	};
+	struct page_pipe_buf *ppb;
+	int ret = -1;
+
+	pthread_mutex_init(&pipe.lock, NULL);
+	pthread_cond_init(&pipe.ready, NULL);
+	pthread_cond_init(&pipe.space, NULL);
+
+	if (pthread_create(&pipe.thread, NULL, dump_xfer_pipeline_main, &pipe) != 0) {
+		pr_err("pthread_create failed for dump xfer pipeline\n");
+		goto out_sync;
+	}
+
+	timing_start(TIME_MEMWRITE);
+	list_for_each_entry(ppb, &pp->bufs, l) {
+		u64 step_start_us = mem_now_us();
+
+		args->nr_segs = ppb->nr_segs;
+		args->nr_pages = ppb->pages_in;
+		pr_debug("PPB: %ld pages %d segs %u pipe %d off\n", args->nr_pages, args->nr_segs, ppb->pipe_size, args->off);
+
+		if (compel_rpc_call(PARASITE_CMD_DUMPPAGES, ctl) < 0)
+			goto out_thread;
+		if (compel_util_send_fd(ctl, ppb->p[1]))
+			goto out_thread;
+		if (compel_rpc_sync(PARASITE_CMD_DUMPPAGES, ctl) < 0)
+			goto out_thread;
+
+		pipe.drain_us += mem_now_us() - step_start_us;
+		args->off += args->nr_segs;
+
+		step_start_us = mem_now_us();
+		pthread_mutex_lock(&pipe.lock);
+		while (pipe.nr_ready == NR_PIPES_PER_CHUNK && !pipe.failed)
+			pthread_cond_wait(&pipe.space, &pipe.lock);
+		pipe.enqueue_wait_us += mem_now_us() - step_start_us;
+		if (pipe.failed) {
+			pthread_mutex_unlock(&pipe.lock);
+			goto out_thread;
+		}
+		pipe.queue[pipe.tail] = ppb;
+		pipe.tail = (pipe.tail + 1) % NR_PIPES_PER_CHUNK;
+		pipe.nr_ready++;
+		pthread_cond_signal(&pipe.ready);
+		pthread_mutex_unlock(&pipe.lock);
+	}
+
+	ret = 0;
+
+out_thread:
+	pthread_mutex_lock(&pipe.lock);
+	pipe.stop = true;
+	if (ret)
+		pipe.failed = true;
+	pthread_cond_broadcast(&pipe.ready);
+	pthread_cond_broadcast(&pipe.space);
+	pthread_mutex_unlock(&pipe.lock);
+
+	pthread_join(pipe.thread, NULL);
+	timing_stop(TIME_MEMWRITE);
+	if (ret == 0 && pipe.failed)
+		ret = -1;
+
+	if (ret == 0) {
+		u64 wall_us = mem_now_us() - pipe.start_us;
+
+		pr_info("Dump xfer pipeline: wall=%llu ms drain=%llu ms enqueue_wait=%llu ms consumer_wait=%llu ms xfer=%llu ms bufs=%u compact=1\n",
+			(unsigned long long)(wall_us / 1000ULL), (unsigned long long)(pipe.drain_us / 1000ULL),
+			(unsigned long long)(pipe.enqueue_wait_us / 1000ULL),
+			(unsigned long long)(pipe.consumer_wait_us / 1000ULL),
+			(unsigned long long)(pipe.xfer_us / 1000ULL), pp->nr_pipes);
+	}
+
+out_sync:
+	pthread_cond_destroy(&pipe.space);
+	pthread_cond_destroy(&pipe.ready);
+	pthread_mutex_destroy(&pipe.lock);
+	return ret;
+}
+
 static int detect_pid_reuse(struct pstree_item *item, struct proc_pid_stat *pps, InventoryEntry *parent_ie)
 {
 	unsigned long long dump_ticks;
@@ -628,10 +797,12 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	 */
 	if (mdc->pre_dump && opts.pre_dump_mode == PRE_DUMP_READ)
 		ret = 0;
+	else if (!mdc->pre_dump && xfer.compact && (pp->flags & PP_CHUNK_MODE))
+		ret = drain_xfer_pages_pipelined(pp, ctl, args, &xfer);
 	else
 		ret = drain_pages(pp, ctl, args);
 
-	if (!ret && !mdc->pre_dump)
+	if (!ret && !mdc->pre_dump && !xfer.compact)
 		ret = xfer_pages(pp, &xfer);
 	if (ret)
 		goto out_xfer;

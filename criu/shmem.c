@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <errno.h>
 
 #include "common/config.h"
 #include "common/list.h"
@@ -34,6 +35,27 @@
 #define SEEK_DATA 3
 #define SEEK_HOLE 4
 #endif
+
+#define PREFAULT_MIN_BYTES (64 * PAGE_SIZE)
+
+static void prefault_write_range(void *addr, unsigned long len, unsigned long *prefault_ms)
+{
+	struct timeval tv0, tv1;
+
+	if (len < PREFAULT_MIN_BYTES)
+		return;
+
+	gettimeofday(&tv0, NULL);
+	if (madvise(addr, len, MADV_POPULATE_WRITE) < 0) {
+		if (errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP)
+			pr_debug("madvise(MADV_POPULATE_WRITE, %p, %lu) failed: %s\n",
+				 addr, len, strerror(errno));
+	}
+	gettimeofday(&tv1, NULL);
+
+	*prefault_ms += (unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 +
+				       (tv1.tv_usec - tv0.tv_usec) / 1000);
+}
 
 /*
  * Hash table and routines for keeping shmid -> shmem_xinfo mappings
@@ -524,6 +546,7 @@ static int do_restore_shmem_content_ex(void *addr, unsigned long size, unsigned 
 {
 	int ret;
 	struct page_read pr;
+	unsigned long prefault_ms = 0;
 
 	ret = open_page_read(shmid, &pr, PR_SHMEM);
 	if (ret < 0)
@@ -531,6 +554,7 @@ static int do_restore_shmem_content_ex(void *addr, unsigned long size, unsigned 
 	if (!ret)
 		return 0;
 
+	prefault_write_range(addr, size, &prefault_ms);
 	ret = shmem_restore_async(&pr, addr, size);
 	pr.close(&pr);
 	return ret;
@@ -543,6 +567,8 @@ static int restore_memfd_shmem_content_ex(int fd, unsigned long shmid, unsigned 
 	int ret = 0;
 	struct page_read pr;
 	struct timeval tv0, tv1;
+	unsigned long prefault_ms = 0;
+	bool used_populate = false;
 
 	if (!size)
 		return 0;
@@ -560,13 +586,21 @@ static int restore_memfd_shmem_content_ex(int fd, unsigned long shmid, unsigned 
 		return -1;
 	}
 
-	addr = mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+	addr = mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED | MAP_POPULATE, fd, 0);
 	if (addr == MAP_FAILED) {
-		pr_perror("Can't mmap shmem 0x%lx size=%ld", shmid, size);
-		pr.close(&pr);
-		return -1;
+		if (errno == EINVAL)
+			addr = mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, 0);
+		if (addr == MAP_FAILED) {
+			pr_perror("Can't mmap shmem 0x%lx size=%ld", shmid, size);
+			pr.close(&pr);
+			return -1;
+		}
+	} else {
+		used_populate = true;
 	}
 
+	if (!used_populate)
+		prefault_write_range(addr, aligned_size, &prefault_ms);
 	ret = shmem_restore_async(&pr, addr, aligned_size);
 	pr.close(&pr);
 
@@ -574,8 +608,9 @@ static int restore_memfd_shmem_content_ex(int fd, unsigned long shmid, unsigned 
 		pr_perror("munmap failed for shmem 0x%lx", shmid);
 
 	gettimeofday(&tv1, NULL);
-	pr_info("memfd shmem restore 0x%lx size=%lu took %lu ms\n", shmid, size,
-		(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000));
+	pr_info("memfd shmem restore 0x%lx size=%lu took %lu ms (prefault %lu ms)\n", shmid, size,
+		(unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000),
+		prefault_ms);
 
 	return ret;
 }

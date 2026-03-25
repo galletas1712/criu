@@ -378,7 +378,7 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 		jobs[i].iocb.aio_buf = (unsigned long)jobs[i].iovs;
 		jobs[i].iocb.aio_nbytes = jobs[i].nr;
 		jobs[i].iocb.aio_offset = jobs[i].file_from;
-		jobs[i].iocb.aio_data = jobs[i].expected;
+		jobs[i].iocb.aio_data = (u64)(unsigned long)&jobs[i];
 		i++;
 	}
 
@@ -440,13 +440,16 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 			aio_getevents_calls++;
 
 			for (long k = 0; k < event_nr; k++) {
-				unsigned int idx;
 				struct iovec *iov_next;
 				unsigned int nr_next;
 
-				cb = (struct iocb *)(unsigned long)events[k].obj;
-				idx = cb - &jobs[0].iocb;
-				job = &jobs[idx];
+				job = (struct compact_aio_job *)(unsigned long)events[k].data;
+				if (!job || job < jobs || job >= jobs + aio_n) {
+					pr_warn("compact AIO completion returned invalid job cookie %#llx, falling back to buffered compact restore\n",
+						(unsigned long long)events[k].data);
+					goto out;
+				}
+				cb = &job->iocb;
 
 				if (events[k].res < 0) {
 					pr_warn("compact AIO read failed: %lld, falling back to buffered compact restore\n",
@@ -483,7 +486,7 @@ static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sor
 				job->iocb.aio_buf = (unsigned long)iov_next;
 				job->iocb.aio_nbytes = nr_next;
 				job->iocb.aio_offset = job->file_from;
-				job->iocb.aio_data = job->remaining;
+				job->iocb.aio_data = (u64)(unsigned long)job;
 				gettimeofday(&stamp0, NULL);
 				ret = local_io_submit(aio_ctx, 1, &cb);
 				gettimeofday(&stamp1, NULL);

@@ -1634,6 +1634,9 @@ static int restore_vma_ios_sync(int fd, struct restore_vma_io *rios, unsigned in
 	unsigned int zero_ios = 0;
 	unsigned int sync_ios = 0;
 	unsigned int copy_ios = 0;
+	unsigned int short_reads = 0;
+	unsigned int max_iovs = 0;
+	unsigned int max_copies = 0;
 	u64 zero_us = 0;
 	u64 sync_us = 0;
 	u64 copy_us = 0;
@@ -1645,6 +1648,10 @@ static int restore_vma_ios_sync(int fd, struct restore_vma_io *rios, unsigned in
 
 		for (unsigned int j = 0; j < (unsigned int)rio->nr_iovs; j++)
 			rio_len += (size_t)rio->iovs[j].iov_len;
+		if ((unsigned int)rio->nr_iovs > max_iovs)
+			max_iovs = (unsigned int)rio->nr_iovs;
+		if ((unsigned int)rio->nr_copies > max_copies)
+			max_copies = (unsigned int)rio->nr_copies;
 
 		if (compact_io_is_zero(rio->off)) {
 			struct timeval zero0, zero1;
@@ -1698,6 +1705,7 @@ static int restore_vma_ios_sync(int fd, struct restore_vma_io *rios, unsigned in
 					return -1;
 				}
 
+				short_reads++;
 				advance_vma_io_retry(rio, bytes, &iov, &nr);
 				off += bytes;
 				remaining -= bytes;
@@ -1719,6 +1727,8 @@ next_rio:
 		sync_restore_len / (1024 * 1024), sync_ios,
 		(unsigned long)(copy_us / 1000ULL),
 		copy_restore_len / (1024 * 1024), copy_ios);
+	pr_info("VMA restore profile jobs %u zero %u short %u max %u iovs max %u copies\n",
+		sync_ios + zero_ios, zero_ios, short_reads, max_iovs, max_copies);
 
 	return 0;
 }
@@ -2056,6 +2066,13 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		unsigned long alloc_sz;
 		unsigned int submitted = 0, completed = 0, aio_n = 0, zero_ios = 0;
 		unsigned int copy_ios = 0;
+		unsigned int aio_submit_calls = 0;
+		unsigned int aio_getevents_calls = 0;
+		unsigned int aio_short_reads = 0;
+		unsigned int aio_retry_submits = 0;
+		unsigned int max_inflight = 0;
+		unsigned int max_iovs = 0;
+		unsigned int max_copies = 0;
 		u64 copy_us = 0;
 		bool aio_ctx_ready = false;
 		bool iocbs_mapped = false;
@@ -2070,6 +2087,10 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 			for (int j = 0; j < rio->nr_iovs; j++)
 				rio_len += (size_t)rio->iovs[j].iov_len;
+			if ((unsigned int)rio->nr_iovs > max_iovs)
+				max_iovs = (unsigned int)rio->nr_iovs;
+			if ((unsigned int)rio->nr_copies > max_copies)
+				max_copies = (unsigned int)rio->nr_copies;
 
 			if (compact_io_is_zero(rio->off)) {
 				for (int j = 0; j < rio->nr_iovs; j++)
@@ -2161,7 +2182,10 @@ __visible long __export_restore_task(struct task_restore_args *args)
 						aio_ret, submitted, aio_n);
 					goto aio_fallback;
 				}
+				aio_submit_calls++;
 				submitted += aio_ret;
+				if (submitted - completed > max_inflight)
+					max_inflight = submitted - completed;
 			}
 
 			if (completed < aio_n) {
@@ -2172,6 +2196,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 						aio_ret);
 					goto aio_fallback;
 				}
+				aio_getevents_calls++;
 				for (long k = 0; k < aio_ret; k++) {
 					struct iocb *cb = (struct iocb *)(unsigned long)events[k].obj;
 					unsigned int idx = cb - iocbs;
@@ -2183,47 +2208,50 @@ __visible long __export_restore_task(struct task_restore_args *args)
 						goto aio_fallback;
 					}
 
-					if (args->auto_dedup && events[k].res > 0 && !compact_io_is_compact(r->off))
-						sys_fallocate(fd,
+						if (args->auto_dedup && events[k].res > 0 && !compact_io_is_compact(r->off))
+							sys_fallocate(fd,
 							      FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
 							      (off_t)cb->aio_offset, (off_t)events[k].res);
 
-					if ((__u64)events[k].res == events[k].data) {
-						restore_vma_io_apply_copies(r, &copy_restore_len, &copy_ios, &copy_us);
-						completed++;
-						continue;
-					}
-					/* Short read (e.g. MAX_RW_COUNT 0x7FFFF000): advance and retry */
-					if (events[k].res == 0) {
-						pr_warn("AIO zero read (expected %llu), falling back to buffered VMA restore\n",
-							events[k].data);
-						goto aio_fallback;
-					}
-					{
-						struct iovec *iov_next;
-						unsigned int nr_next;
-
-						advance_vma_io_retry(r, events[k].res, &iov_next, &nr_next);
-						if (!iov_next || nr_next == 0) {
+						if ((__u64)events[k].res == events[k].data) {
 							restore_vma_io_apply_copies(r, &copy_restore_len, &copy_ios, &copy_us);
 							completed++;
 							continue;
 						}
-						cb->aio_buf = (unsigned long)iov_next;
-						cb->aio_nbytes = nr_next;
-						cb->aio_offset = compact_io_decode(r->off);
-						cb->aio_data -= (__u64)events[k].res;
+						/* Short read (e.g. MAX_RW_COUNT 0x7FFFF000): advance and retry */
+						if (events[k].res == 0) {
+							pr_warn("AIO zero read (expected %llu), falling back to buffered VMA restore\n",
+								events[k].data);
+							goto aio_fallback;
+						}
 						{
-							long ret2 = sys_io_submit(aio_ctx, 1, &cb);
-							if (ret2 != 1) {
-								pr_warn("AIO retry submit failed: %ld, falling back to buffered VMA restore\n",
-									ret2);
-								goto aio_fallback;
+							struct iovec *iov_next;
+							unsigned int nr_next;
+
+							aio_short_reads++;
+							advance_vma_io_retry(r, events[k].res, &iov_next, &nr_next);
+							if (!iov_next || nr_next == 0) {
+								restore_vma_io_apply_copies(r, &copy_restore_len, &copy_ios, &copy_us);
+								completed++;
+								continue;
 							}
+							cb->aio_buf = (unsigned long)iov_next;
+							cb->aio_nbytes = nr_next;
+							cb->aio_offset = compact_io_decode(r->off);
+							cb->aio_data -= (__u64)events[k].res;
+							{
+								long ret2 = sys_io_submit(aio_ctx, 1, &cb);
+								if (ret2 != 1) {
+									pr_warn("AIO retry submit failed: %ld, falling back to buffered VMA restore\n",
+										ret2);
+									goto aio_fallback;
+								}
+							}
+							aio_submit_calls++;
+							aio_retry_submits++;
 						}
 					}
 				}
-			}
 		}
 
 		goto aio_done;
@@ -2249,6 +2277,9 @@ aio_fallback:
 			vma_restore_len / (1024 * 1024), aio_n,
 			(unsigned long)(copy_us / 1000ULL),
 			copy_restore_len / (1024 * 1024), copy_ios);
+		pr_info("VMA restore profile jobs %u aio %u zero %u submit %u getevents %u short %u resubmit %u max inflight %u max %u iovs max %u copies\n",
+			aio_n + zero_ios, aio_n, zero_ios, aio_submit_calls, aio_getevents_calls,
+			aio_short_reads, aio_retry_submits, max_inflight, max_iovs, max_copies);
 		sys_close(fd);
 		args->vma_ios_fd = -1;
 #undef AIO_BATCH

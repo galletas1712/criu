@@ -56,6 +56,10 @@ struct compact_page_group {
 	unsigned int nr_dsts;
 };
 
+static inline bool compact_io_is_zero(off_t off);
+static inline bool compact_io_is_run(off_t off);
+static inline off_t compact_io_decode(off_t off);
+
 static int compact_page_ref_cmp(const void *a, const void *b)
 {
 	const struct compact_page_ref *ra = a;
@@ -77,6 +81,75 @@ static void free_page_read_iov(struct page_read_iov *piov)
 	xfree(piov->copies);
 	xfree(piov->to_base);
 	xfree(piov);
+}
+
+static int append_page_read_iov(struct page_read_iov *dst, struct page_read_iov *src)
+{
+	struct iovec *to = NULL;
+	struct restore_vma_copy *copies = NULL;
+	unsigned int old_nr = dst->nr;
+	unsigned int old_copies = dst->nr_copies;
+	unsigned int nr = dst->nr + src->nr;
+	unsigned int nr_copies = dst->nr_copies + src->nr_copies;
+
+	to = xmalloc(nr * sizeof(*to));
+	if (!to)
+		return -1;
+
+	memcpy(to, dst->to_base, dst->nr * sizeof(*to));
+	memcpy(&to[old_nr], src->to, src->nr * sizeof(*src->to));
+
+	if (nr_copies > 0) {
+		copies = xmalloc(nr_copies * sizeof(*copies));
+		if (!copies) {
+			xfree(to);
+			return -1;
+		}
+
+		if (old_copies > 0)
+			memcpy(copies, dst->copies, old_copies * sizeof(*copies));
+		memcpy(&copies[old_copies], src->copies, src->nr_copies * sizeof(*src->copies));
+	}
+
+	xfree(dst->to_base);
+	xfree(dst->copies);
+	dst->to_base = to;
+	dst->to = to;
+	dst->copies = copies;
+	dst->nr = nr;
+	dst->nr_copies = nr_copies;
+	dst->end += src->end - src->from;
+
+	free_page_read_iov(src);
+	return 0;
+}
+
+static int append_compact_page_read_iov(struct list_head *to, struct page_read_iov *src)
+{
+	struct page_read_iov *dst;
+	bool same_zero;
+	bool same_run;
+
+	if (list_empty(to)) {
+		list_add_tail(&src->l, to);
+		return 0;
+	}
+
+	dst = list_entry(to->prev, struct page_read_iov, l);
+	same_zero = compact_io_is_zero(dst->from) && compact_io_is_zero(src->from);
+	same_run = compact_io_is_run(dst->from) && compact_io_is_run(src->from) &&
+		   compact_io_decode(src->from) == compact_io_decode(dst->end);
+	if (!same_zero && !same_run) {
+		list_add_tail(&src->l, to);
+		return 0;
+	}
+
+	if (dst->nr + src->nr > IOV_MAX) {
+		list_add_tail(&src->l, to);
+		return 0;
+	}
+
+	return append_page_read_iov(dst, src);
 }
 
 static inline bool can_extend_bunch(struct iovec *bunch, unsigned long off, unsigned long len)
@@ -853,7 +926,10 @@ static int enqueue_compact_iovecs(struct page_read *pr, void *buf, unsigned long
 			}
 		}
 
-		list_add_tail(&piov->l, to);
+		ret = append_compact_page_read_iov(to, piov);
+		if (ret)
+			goto out;
+
 		i = run_start + run_pages;
 	}
 
@@ -874,6 +950,13 @@ out:
 int pagemap_render_iovec(struct list_head *from, struct task_restore_args *ta)
 {
 	struct page_read_iov *piov;
+	unsigned int compact_jobs = 0;
+	unsigned int zero_jobs = 0;
+	unsigned int max_iovs = 0;
+	unsigned int max_copies = 0;
+	unsigned long compact_pages = 0;
+	unsigned long zero_pages = 0;
+	unsigned long copy_pages = 0;
 
 	ta->vma_ios = (struct restore_vma_io *)rst_mem_align_cpos(RM_PRIVATE);
 	ta->vma_ios_n = 0;
@@ -897,8 +980,25 @@ int pagemap_render_iovec(struct list_head *from, struct task_restore_args *ta)
 			memcpy(copies, piov->copies, piov->nr_copies * sizeof(*copies));
 		}
 
+		if (compact_io_is_zero(piov->from)) {
+			zero_jobs++;
+			zero_pages += (unsigned long)((piov->end - piov->from) / PAGE_SIZE);
+		} else if (compact_io_is_run(piov->from)) {
+			compact_jobs++;
+			compact_pages += piov->nr;
+			copy_pages += piov->nr_copies;
+		}
+
+		if (piov->nr > max_iovs)
+			max_iovs = piov->nr;
+		if (piov->nr_copies > max_copies)
+			max_copies = piov->nr_copies;
+
 		ta->vma_ios_n++;
 	}
+
+	pr_info("pagemap render profile rios %u compact %u (%lu unique pages, %lu copy pages) zero %u (%lu zero pages) max %u iovs max %u copies\n",
+		ta->vma_ios_n, compact_jobs, compact_pages, copy_pages, zero_jobs, zero_pages, max_iovs, max_copies);
 
 	return 0;
 }
@@ -1140,8 +1240,13 @@ static int process_async_reads(struct page_read *pr)
 	struct timeval tv0, tv1, tv2, copy0, copy1;
 	size_t zero_bytes = 0;
 	size_t copy_bytes = 0;
+	size_t read_bytes = 0;
 	unsigned int zero_ios = 0;
 	unsigned int copy_ios = 0;
+	unsigned int read_ios = 0;
+	unsigned int short_reads = 0;
+	unsigned int max_iovs = 0;
+	unsigned int max_copies = 0;
 	u64 copy_us = 0;
 
 	fd = img_raw_fd(pr->pi);
@@ -1192,6 +1297,12 @@ static int process_async_reads(struct page_read *pr)
 
 		pr_debug("Read piov iovs %d, from %lld, len %zu, first %p:%zu\n", piov->nr,
 			 (long long)file_from, remaining, piov->to->iov_base, piov->to->iov_len);
+		read_ios++;
+		read_bytes += remaining;
+		if (piov->nr > max_iovs)
+			max_iovs = piov->nr;
+		if (piov->nr_copies > max_copies)
+			max_copies = piov->nr_copies;
 	more:
 		bytes = preadv(fd, piov->to, piov->nr, file_from);
 		if (fault_injected(FI_PARTIAL_PAGES)) {
@@ -1227,7 +1338,7 @@ static int process_async_reads(struct page_read *pr)
 			 * Modify the piov in-place, we're going to drop this one
 			 * anyway.
 			 */
-
+			short_reads++;
 			advance_piov(piov, bytes);
 			file_from += bytes;
 			remaining -= bytes;
@@ -1266,15 +1377,17 @@ static int process_async_reads(struct page_read *pr)
 	if (have_range && last_end > first_off) {
 		unsigned long fadv_ms = (unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000);
 		unsigned long preadv_ms = (unsigned long)((tv2.tv_sec - tv1.tv_sec) * 1000 + (tv2.tv_usec - tv1.tv_usec) / 1000);
-		pr_info("pagemap async fadvise %lu ms preadv %lu ms zero-fill %zu MiB (%u ios) copy %lu ms (%zu MiB, %u ios) (range %zu MiB)\n",
+		pr_info("pagemap async fadvise %lu ms preadv %lu ms zero-fill %zu MiB (%u ios) copy %lu ms (%zu MiB, %u ios) read %zu MiB (%u ios, %u short, max %u iovs, max %u copies) (range %zu MiB)\n",
 			fadv_ms, preadv_ms, zero_bytes / (1024 * 1024), zero_ios,
 			(unsigned long)(copy_us / 1000ULL), copy_bytes / (1024 * 1024), copy_ios,
+			read_bytes / (1024 * 1024), read_ios, short_reads, max_iovs, max_copies,
 			(size_t)((last_end - first_off) / (1024 * 1024)));
 	} else if (zero_bytes > 0 || copy_bytes > 0) {
 		unsigned long zero_ms = (unsigned long)((tv2.tv_sec - tv1.tv_sec) * 1000 + (tv2.tv_usec - tv1.tv_usec) / 1000);
-		pr_info("pagemap async zero-fill %lu ms (%zu MiB, %u ios) copy %lu ms (%zu MiB, %u ios)\n",
+		pr_info("pagemap async zero-fill %lu ms (%zu MiB, %u ios) copy %lu ms (%zu MiB, %u ios) read %zu MiB (%u ios, %u short, max %u iovs, max %u copies)\n",
 			zero_ms, zero_bytes / (1024 * 1024), zero_ios,
-			(unsigned long)(copy_us / 1000ULL), copy_bytes / (1024 * 1024), copy_ios);
+			(unsigned long)(copy_us / 1000ULL), copy_bytes / (1024 * 1024), copy_ios,
+			read_bytes / (1024 * 1024), read_ios, short_reads, max_iovs, max_copies);
 	}
 
 	if (pr->parent)
@@ -1600,9 +1713,13 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	else if (opts.stream)
 		pr->maybe_read_page = maybe_read_page_img_streamer;
 	else {
+		bool can_pie = !pr->parent && !opts.lazy_pages;
+
 		pr->maybe_read_page = maybe_read_page_local;
-		if (!pr->parent && !opts.lazy_pages)
-			pr->pieok = true;
+		pr->pieok = can_pie;
+		if (pr->pidx)
+			pr_info("Compact page read pages_id %u PIE %s (parent %d lazy %d)\n",
+				pr->pages_img_id, can_pie ? "enabled" : "disabled", !!pr->parent, !!opts.lazy_pages);
 	}
 
 	pr_debug("Opened %s page read %u (parent %u)\n", remote ? "remote" : "local", pr->id,

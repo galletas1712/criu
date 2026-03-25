@@ -1462,7 +1462,7 @@ struct open_vma_unique {
 	bool is_memfd;
 };
 
-#define OPEN_VMAS_MEMFD_WORKERS_MAX 8
+#define OPEN_VMAS_MEMFD_WORKERS_MAX 32
 
 struct memfd_open_plan {
 	struct open_vma_unique **jobs;

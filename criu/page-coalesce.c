@@ -785,6 +785,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 				struct coalesce_stats *stats)
 {
 	char pages_path[PATH_MAX] = {};
+	char index_path[PATH_MAX] = {};
 	struct page_batch_meta *meta = NULL;
 	struct chunk_group_slot *chunk_groups = NULL;
 	unsigned int *chunk_group_of_page = NULL;
@@ -843,7 +844,16 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		goto out;
 	}
 
-	old_pages = open_pages_image_at(dfd, O_RSTR, pagemap, &pages_id);
+	{
+		PagemapHead *h;
+
+		if (pb_read_one(pagemap, &h, PB_PAGEMAP_HEAD) < 0)
+			goto out;
+		pages_id = h->pages_id;
+		pagemap_head__free_unpacked(h, NULL);
+	}
+
+	old_pages = open_image_at(dfd, CR_FD_PAGES, O_RSTR, pages_id);
 	if (!old_pages || empty_image(old_pages)) {
 		pr_err("Missing pages image for id %u\n", pages_id);
 		goto out;
@@ -989,6 +999,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	}
 
 	snprintf(pages_path, sizeof(pages_path), imgset_template[CR_FD_PAGES].fmt, pages_id);
+	snprintf(index_path, sizeof(index_path), imgset_template[CR_FD_PAGE_INDEX].fmt, pages_id);
 
 	store->blob_write_us += writer.write_us;
 	image_blob_write_us = writer.write_us;
@@ -1042,6 +1053,8 @@ out:
 		pr_perror("Can't remove original pages image %s", pages_path);
 		ret = -1;
 	}
+	if (ret != 0 && unlinkat(dfd, index_path, 0) && errno != ENOENT)
+		pr_perror("Can't remove partial compact page index %s", index_path);
 
 	return ret;
 }

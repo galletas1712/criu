@@ -817,6 +817,19 @@ static bool page_index_exists(int dfd, u32 pages_id)
 	return exists;
 }
 
+static bool raw_pages_exist(int dfd, u32 pages_id)
+{
+	bool exists;
+	struct cr_img *pages = open_image_at(dfd, CR_FD_PAGES, O_RSTR, pages_id);
+
+	if (!pages)
+		return false;
+
+	exists = !empty_image(pages);
+	close_image(pages);
+	return exists;
+}
+
 struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
 {
 	if (flags == O_RDONLY || flags == O_RDWR) {
@@ -826,7 +839,13 @@ struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *
 		*id = h->pages_id;
 		pagemap_head__free_unpacked(h, NULL);
 
-		if (page_index_exists(dfd, *id))
+		/*
+		 * A compact image is committed only once the raw pages-%u.img has
+		 * been removed. If the raw file is still present, prefer it so
+		 * stale or partial page-index sidecars never flip restore into
+		 * compact mode.
+		 */
+		if (page_index_exists(dfd, *id) && !raw_pages_exist(dfd, *id))
 			return open_image_at(dfd, CR_FD_PAGES_BLOB, O_RSTR);
 	} else {
 		PagemapHead h = PAGEMAP_HEAD__INIT;

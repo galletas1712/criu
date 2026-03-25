@@ -1692,6 +1692,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	int flags, i_typ;
 	static unsigned ids = 1;
 	bool remote = pr_flags & PR_REMOTE;
+	bool try_direct_open = true;
 
 	/*
 	 * Only the top-most page-read can be remote, all the
@@ -1747,7 +1748,9 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		return -1;
 	}
 
-	pr->pi = open_pages_image_at(dfd, flags | O_TRY_DIRECT_OPEN, pr->pmi, &pr->pages_img_id);
+reopen_pages:
+	pr->pi = open_pages_image_at(dfd, flags | (try_direct_open ? O_TRY_DIRECT_OPEN : 0),
+				     pr->pmi, &pr->pages_img_id);
 	if (!pr->pi || empty_image(pr->pi)) {
 		close_page_read(pr);
 		return -1;
@@ -1765,13 +1768,24 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		}
 	}
 
-	if (!pr->pidx) {
+	{
 		int pfd = img_raw_fd(pr->pi);
 		if (pfd >= 0) {
 			int fl = fcntl(pfd, F_GETFL);
 			if (fl >= 0 && (fl & O_DIRECT)) {
+				char probe[4096] __attribute__((aligned(4096)));
+
+				if (pread(pfd, probe, sizeof(probe), 0) < 0 && errno == EINVAL) {
+					pr_info("O_DIRECT rejected at read time on pages fd %d, reopening buffered I/O\n",
+						pfd);
+					close_image(pr->pi);
+					pr->pi = NULL;
+					try_direct_open = false;
+					goto reopen_pages;
+				}
 				pr_debug("O_DIRECT enabled on pages fd %d at open time\n", pfd);
-				pr->use_direct = true;
+				if (!pr->pidx)
+					pr->use_direct = true;
 			} else {
 				posix_fadvise(pfd, 0, 0, POSIX_FADV_SEQUENTIAL);
 			}

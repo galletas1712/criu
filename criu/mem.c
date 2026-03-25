@@ -2077,6 +2077,7 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 	struct cr_img *pages;
 	struct cr_img *index;
 	bool compact;
+	bool try_direct_open = true;
 
 	/*
 	 * We optimize the case when rsti(t)->vma_io is empty.
@@ -2099,14 +2100,16 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 	compact = !empty_image(index);
 	close_image(index);
 
+reopen_pages:
 	/*
 	 * If auto-dedup is on we need RDWR mode to be able to punch holes in
 	 * the input files (in restorer.c)
 	 */
 	if (compact)
-		pages = open_image(CR_FD_PAGES_BLOB, O_RSTR | O_TRY_DIRECT_OPEN);
+		pages = open_image(CR_FD_PAGES_BLOB, O_RSTR | (try_direct_open ? O_TRY_DIRECT_OPEN : 0));
 	else
-		pages = open_image(CR_FD_PAGES, (opts.auto_dedup ? O_RDWR : O_RSTR) | O_TRY_DIRECT_OPEN,
+		pages = open_image(CR_FD_PAGES,
+				   (opts.auto_dedup ? O_RDWR : O_RSTR) | (try_direct_open ? O_TRY_DIRECT_OPEN : 0),
 				   rsti(t)->pages_img_id);
 	if (!pages)
 		return -1;
@@ -2120,10 +2123,21 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 	ta->vma_ios_fd = img_raw_fd(pages);
 	if (ta->vma_ios_fd >= 0) {
 		int fl = fcntl(ta->vma_ios_fd, F_GETFL);
-		if (fl >= 0 && (fl & O_DIRECT))
+		if (fl >= 0 && (fl & O_DIRECT)) {
+			char probe[4096] __attribute__((aligned(4096)));
+
+			if (pread(ta->vma_ios_fd, probe, sizeof(probe), 0) < 0 && errno == EINVAL) {
+				pr_info("O_DIRECT rejected at read time on pages fd %d, reopening buffered I/O\n",
+					ta->vma_ios_fd);
+				close_image(pages);
+				pages = NULL;
+				try_direct_open = false;
+				goto reopen_pages;
+			}
 			pr_info("O_DIRECT enabled on pages fd %d at open time\n", ta->vma_ios_fd);
-		else
+		} else {
 			posix_fadvise(ta->vma_ios_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+		}
 	}
 	return pagemap_render_iovec(&rsti(t)->vma_io, ta);
 }

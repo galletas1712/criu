@@ -609,7 +609,7 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 	flags = oflags & ~(O_NOBUF | O_SERVICE | O_FORCE_LOCAL | O_TRY_DIRECT_OPEN);
 	open_flags = flags;
 	try_direct_open = oflags & O_TRY_DIRECT_OPEN;
-	if (try_direct_open)
+	if (try_direct_open && !opts.stream)
 		open_flags |= O_DIRECT;
 
 	if (opts.stream && !(oflags & O_FORCE_LOCAL)) {
@@ -633,7 +633,7 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 	} else
 		ret = openat(dfd, path, open_flags, CR_FD_PERM);
 
-	if (ret < 0 && try_direct_open &&
+	if (ret < 0 && try_direct_open && !opts.stream &&
 	    (errno == EINVAL || errno == EOPNOTSUPP || errno == ENOTSUP || errno == EISDIR || errno == EPERM)) {
 		pr_info("O_DIRECT open rejected for %s, retrying buffered I/O\n", path);
 

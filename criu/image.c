@@ -858,6 +858,11 @@ bool compact_pages_committed(int dfd, u32 pages_id)
 	return page_index_exists(dfd, pages_id) && pages_blob_exists(dfd);
 }
 
+bool compact_pages_ready(int dfd, u32 pages_id)
+{
+	return compact_pages_committed(dfd, pages_id) && !raw_pages_exist(dfd, pages_id);
+}
+
 int clear_compact_pages_commit(int dfd)
 {
 	if (!unlinkat(dfd, COMPACT_PAGES_COMMIT_FILE, 0))
@@ -925,7 +930,7 @@ struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *
 	if (open_pages_image_id(flags, pmi, id))
 		return NULL;
 
-	if ((flags == O_RDONLY || flags == O_RDWR) && compact_pages_committed(dfd, *id) && !raw_pages_exist(dfd, *id))
+	if ((flags == O_RDONLY || flags == O_RDWR) && compact_pages_ready(dfd, *id))
 		return open_image_at(dfd, CR_FD_PAGES_BLOB, O_RSTR);
 
 	return open_image_at(dfd, CR_FD_PAGES, flags, *id);

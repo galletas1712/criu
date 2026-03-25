@@ -178,6 +178,7 @@ extern struct cr_img *open_image_at(int dfd, int type, unsigned long flags, ...)
 #define open_image(typ, flags, ...) open_image_at(-1, typ, flags, ##__VA_ARGS__)
 extern int open_image_lazy(struct cr_img *img);
 extern bool compact_pages_committed(int dfd, u32 pages_id);
+extern bool compact_pages_ready(int dfd, u32 pages_id);
 extern int clear_compact_pages_commit(int dfd);
 extern int mark_compact_pages_commit(int dfd);
 extern struct cr_img *open_pages_image(unsigned long flags, struct cr_img *pmi, u32 *pages_id);

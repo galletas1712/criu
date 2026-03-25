@@ -603,12 +603,17 @@ static int userns_openat(void *arg, int dfd, int pid)
 
 static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long oflags, char *path)
 {
-	int ret, flags;
+	int ret, flags, open_flags;
+	bool try_direct_open;
 
-	flags = oflags & ~(O_NOBUF | O_SERVICE | O_FORCE_LOCAL);
+	flags = oflags & ~(O_NOBUF | O_SERVICE | O_FORCE_LOCAL | O_TRY_DIRECT_OPEN);
+	open_flags = flags;
+	try_direct_open = oflags & O_TRY_DIRECT_OPEN;
+	if (try_direct_open)
+		open_flags |= O_DIRECT;
 
 	if (opts.stream && !(oflags & O_FORCE_LOCAL)) {
-		ret = img_streamer_open(path, flags);
+		ret = img_streamer_open(path, open_flags);
 		errno = EIO; /* errno value is meaningless, only the ret value is meaningful */
 	} else if (root_ns_mask & CLONE_NEWUSER && type == CR_FD_PAGES && oflags & O_RDWR) {
 		/*
@@ -617,7 +622,7 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 		 * usernsd to do it for us
 		 */
 		struct openat_args pa = {
-			.flags = flags,
+			.flags = open_flags,
 			.err = 0,
 			.mode = CR_FD_PERM,
 		};
@@ -626,7 +631,29 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 		if (ret < 0)
 			errno = pa.err;
 	} else
-		ret = openat(dfd, path, flags, CR_FD_PERM);
+		ret = openat(dfd, path, open_flags, CR_FD_PERM);
+
+	if (ret < 0 && try_direct_open &&
+	    (errno == EINVAL || errno == EOPNOTSUPP || errno == ENOTSUP || errno == EISDIR || errno == EPERM)) {
+		pr_info("O_DIRECT open rejected for %s, retrying buffered I/O\n", path);
+
+		if (opts.stream && !(oflags & O_FORCE_LOCAL)) {
+			ret = img_streamer_open(path, flags);
+			errno = EIO; /* errno value is meaningless, only the ret value is meaningful */
+		} else if (root_ns_mask & CLONE_NEWUSER && type == CR_FD_PAGES && oflags & O_RDWR) {
+			struct openat_args pa = {
+				.flags = flags,
+				.err = 0,
+				.mode = CR_FD_PERM,
+			};
+			snprintf(pa.path, PATH_MAX, "%s", path);
+			ret = userns_call(userns_openat, UNS_FDOUT, &pa, sizeof(struct openat_args), dfd);
+			if (ret < 0)
+				errno = pa.err;
+		} else {
+			ret = openat(dfd, path, flags, CR_FD_PERM);
+		}
+	}
 	if (ret < 0) {
 		if (!(flags & O_CREAT) && (errno == ENOENT || ret == -ENOENT)) {
 			pr_info("No %s image\n", path);
@@ -899,7 +926,9 @@ int mark_compact_pages_commit(int dfd)
 
 static int open_pages_image_id(unsigned long flags, struct cr_img *pmi, u32 *id)
 {
-	if (flags == O_RDONLY || flags == O_RDWR) {
+	unsigned long io_flags = flags & ~O_TRY_DIRECT_OPEN;
+
+	if (io_flags == O_RDONLY || io_flags == O_RDWR) {
 		PagemapHead *h;
 
 		if (pb_read_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
@@ -927,11 +956,13 @@ struct cr_img *open_raw_pages_image_at(int dfd, unsigned long flags, struct cr_i
 
 struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
 {
+	unsigned long io_flags = flags & ~O_TRY_DIRECT_OPEN;
+
 	if (open_pages_image_id(flags, pmi, id))
 		return NULL;
 
-	if ((flags == O_RDONLY || flags == O_RDWR) && compact_pages_ready(dfd, *id))
-		return open_image_at(dfd, CR_FD_PAGES_BLOB, O_RSTR);
+	if ((io_flags == O_RDONLY || io_flags == O_RDWR) && compact_pages_ready(dfd, *id))
+		return open_image_at(dfd, CR_FD_PAGES_BLOB, O_RSTR | (flags & O_TRY_DIRECT_OPEN));
 
 	return open_image_at(dfd, CR_FD_PAGES, flags, *id);
 }

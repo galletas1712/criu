@@ -1747,7 +1747,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		return -1;
 	}
 
-	pr->pi = open_pages_image_at(dfd, flags, pr->pmi, &pr->pages_img_id);
+	pr->pi = open_pages_image_at(dfd, flags | O_TRY_DIRECT_OPEN, pr->pmi, &pr->pages_img_id);
 	if (!pr->pi || empty_image(pr->pi)) {
 		close_page_read(pr);
 		return -1;
@@ -1769,38 +1769,11 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		int pfd = img_raw_fd(pr->pi);
 		if (pfd >= 0) {
 			int fl = fcntl(pfd, F_GETFL);
-			if (fl >= 0) {
-				int ret = fcntl(pfd, F_SETFL, fl | O_DIRECT);
-				if (ret < 0) {
-					pr_warn("Failed to set O_DIRECT on pages fd %d: %s\n", pfd, strerror(errno));
-				} else {
-					/*
-					 * Probe: some NFS servers (e.g. Azure) accept O_DIRECT via
-					 * fcntl but reject it at pread time with EINVAL. Fall back
-					 * to buffered I/O in that case.
-					 */
-					char probe[4096] __attribute__((aligned(4096)));
-					if (pread(pfd, probe, sizeof(probe), 0) < 0 && errno == EINVAL) {
-						pr_info("O_DIRECT rejected at read time on pages fd %d (NFS?), using buffered I/O\n", pfd);
-						if (fcntl(pfd, F_SETFL, fl) < 0) {
-							pr_err("Failed to clear O_DIRECT on pages fd %d: %s"
-							       " -- all subsequent reads will fail with EINVAL\n",
-							       pfd, strerror(errno));
-							return -1;
-						}
-						/*
-						 * Hint the kernel to use large sequential read-ahead.
-						 * Linux 5.4+ reduced the default NFS read_ahead_kb from
-						 * ~15 MB to 128 KB, which severely hurts sequential
-						 * throughput on Azure NFS. POSIX_FADV_SEQUENTIAL asks
-						 * the kernel to double the read-ahead window automatically.
-						 */
-						posix_fadvise(pfd, 0, 0, POSIX_FADV_SEQUENTIAL);
-					} else {
-						pr_debug("O_DIRECT enabled on pages fd %d\n", pfd);
-						pr->use_direct = true;
-					}
-				}
+			if (fl >= 0 && (fl & O_DIRECT)) {
+				pr_debug("O_DIRECT enabled on pages fd %d at open time\n", pfd);
+				pr->use_direct = true;
+			} else {
+				posix_fadvise(pfd, 0, 0, POSIX_FADV_SEQUENTIAL);
 			}
 		}
 	}

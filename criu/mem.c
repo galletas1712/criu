@@ -2104,9 +2104,10 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 	 * the input files (in restorer.c)
 	 */
 	if (compact)
-		pages = open_image(CR_FD_PAGES_BLOB, O_RSTR);
+		pages = open_image(CR_FD_PAGES_BLOB, O_RSTR | O_TRY_DIRECT_OPEN);
 	else
-		pages = open_image(CR_FD_PAGES, opts.auto_dedup ? O_RDWR : O_RSTR, rsti(t)->pages_img_id);
+		pages = open_image(CR_FD_PAGES, (opts.auto_dedup ? O_RDWR : O_RSTR) | O_TRY_DIRECT_OPEN,
+				   rsti(t)->pages_img_id);
 	if (!pages)
 		return -1;
 	if (empty_image(pages)) {
@@ -2119,39 +2120,10 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 	ta->vma_ios_fd = img_raw_fd(pages);
 	if (ta->vma_ios_fd >= 0) {
 		int fl = fcntl(ta->vma_ios_fd, F_GETFL);
-		if (fl >= 0) {
-			int ret = fcntl(ta->vma_ios_fd, F_SETFL, fl | O_DIRECT);
-			if (ret < 0) {
-				pr_warn("Failed to set O_DIRECT on pages fd: %s\n", strerror(errno));
-			} else {
-				/*
-				 * Probe: some NFS servers (e.g. Azure) accept O_DIRECT via
-				 * fcntl but reject it at pread time with EINVAL. Fall back
-				 * to buffered I/O in that case.
-				 */
-				char probe[4096] __attribute__((aligned(4096)));
-				if (pread(ta->vma_ios_fd, probe, sizeof(probe), 0) < 0 && errno == EINVAL) {
-					pr_info("O_DIRECT rejected at read time on pages fd %d (NFS?), using buffered I/O\n",
-						ta->vma_ios_fd);
-					if (fcntl(ta->vma_ios_fd, F_SETFL, fl) < 0) {
-						pr_err("Failed to clear O_DIRECT on pages fd %d: %s"
-						      " -- all subsequent reads will fail with EINVAL\n",
-						      ta->vma_ios_fd, strerror(errno));
-						return -1;
-					}
-					/*
-					 * Hint the kernel to use large sequential read-ahead.
-					 * Linux 5.4+ reduced the default NFS read_ahead_kb from
-					 * ~15 MB to 128 KB, which severely hurts sequential
-					 * throughput on Azure NFS. POSIX_FADV_SEQUENTIAL asks
-					 * the kernel to double the read-ahead window automatically.
-					 */
-					posix_fadvise(ta->vma_ios_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-				} else {
-					pr_info("O_DIRECT enabled on pages fd %d\n", ta->vma_ios_fd);
-				}
-			}
-		}
+		if (fl >= 0 && (fl & O_DIRECT))
+			pr_info("O_DIRECT enabled on pages fd %d at open time\n", ta->vma_ios_fd);
+		else
+			posix_fadvise(ta->vma_ios_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 	}
 	return pagemap_render_iovec(&rsti(t)->vma_io, ta);
 }

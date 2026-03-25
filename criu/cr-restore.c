@@ -1669,15 +1669,15 @@ static int __restore_task_with_children(void *_arg)
 	struct cr_clone_arg *ca = _arg;
 	pid_t pid;
 	int ret;
-	u64 total_start_us = restore_tail_now_us();
-	u64 mnt_ns_us = 0;
-	u64 prepare_mappings_us = 0;
-	u64 sigactions_us = 0;
-	u64 transport_us = 0;
-	u64 create_children_us = 0;
-	u64 proc_misc_us = 0;
-	u64 stage_wait_us = 0;
-	u64 step_start_us;
+	__maybe_unused u64 total_start_us = restore_tail_now_us();
+	__maybe_unused u64 mnt_ns_us = 0;
+	__maybe_unused u64 prepare_mappings_us = 0;
+	__maybe_unused u64 sigactions_us = 0;
+	__maybe_unused u64 transport_us = 0;
+	__maybe_unused u64 create_children_us = 0;
+	__maybe_unused u64 proc_misc_us = 0;
+	__maybe_unused u64 stage_wait_us = 0;
+	__maybe_unused u64 step_start_us;
 
 	current = ca->item;
 

@@ -1836,7 +1836,9 @@ static void advance_piov(struct page_read_iov *piov, ssize_t len)
 {
 	ssize_t olen = len;
 	int onr = piov->nr;
-	piov->from += len;
+	u64 flags = ((u64)piov->from) & COMPACT_IO_FLAG_MASK;
+
+	piov->from = (off_t)(flags | ((u64)compact_io_decode(piov->from) + len));
 
 	while (len) {
 		struct iovec *cur = piov->to;

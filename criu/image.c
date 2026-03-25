@@ -19,8 +19,11 @@
 #include "proc_parse.h"
 #include "img-streamer.h"
 #include "namespaces.h"
+#include "fs-magic.h"
 
 #define COMPACT_PAGES_COMMIT_FILE "pages-dedup.ready"
+#define CIFS_SUPER_MAGIC 0xFF534D42
+#define SMB2_SUPER_MAGIC 0x517B
 
 bool ns_per_id = false;
 bool img_common_magic = true;
@@ -601,6 +604,24 @@ static int userns_openat(void *arg, int dfd, int pid)
 	return ret;
 }
 
+static bool image_direct_io_should_fallback(int fd, const char *path)
+{
+	struct statfs st;
+
+	if (fstatfs(fd, &st) < 0)
+		return false;
+
+	switch ((unsigned long)st.f_type) {
+	case NFS_SUPER_MAGIC:
+	case CIFS_SUPER_MAGIC:
+	case SMB2_SUPER_MAGIC:
+		pr_info("O_DIRECT disabled for %s on remote fs type 0x%lx\n", path, (unsigned long)st.f_type);
+		return true;
+	default:
+		return false;
+	}
+}
+
 static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long oflags, char *path)
 {
 	int ret, flags, open_flags;
@@ -666,6 +687,17 @@ static int do_open_image(struct cr_img *img, int dfd, int type, unsigned long of
 	}
 
 	img->_x.fd = ret;
+	if (try_direct_open && !opts.stream && image_direct_io_should_fallback(img->_x.fd, path)) {
+		close(img->_x.fd);
+		img->_x.fd = -1;
+		try_direct_open = false;
+		ret = openat(dfd, path, flags, CR_FD_PERM);
+		if (ret < 0) {
+			pr_perror("Unable to reopen %s without O_DIRECT", path);
+			goto err;
+		}
+		img->_x.fd = ret;
+	}
 	if (oflags & O_NOBUF)
 		bfd_setraw(&img->_x);
 	else {

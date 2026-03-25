@@ -1614,6 +1614,44 @@ static int fd_poll(int inotify_fd)
 	return sys_ppoll(&pfd, 1, &tmo, NULL, sizeof(sigset_t));
 }
 
+#define COMPACT_IO_RUN_FLAG  ((__u64)1 << 62)
+#define COMPACT_IO_ZERO_FLAG ((__u64)1 << 61)
+#define COMPACT_IO_FLAG_MASK (COMPACT_IO_RUN_FLAG | COMPACT_IO_ZERO_FLAG)
+
+static inline bool compact_io_is_zero(loff_t off)
+{
+	return (((__u64)off) & COMPACT_IO_ZERO_FLAG) != 0;
+}
+
+static inline bool compact_io_is_compact(loff_t off)
+{
+	return (((__u64)off) & COMPACT_IO_FLAG_MASK) != 0;
+}
+
+static inline loff_t compact_io_decode(loff_t off)
+{
+	return (loff_t)(((__u64)off) & ~COMPACT_IO_FLAG_MASK);
+}
+
+static inline loff_t compact_io_advance(loff_t off, ssize_t len)
+{
+	return (loff_t)((((__u64)off) & COMPACT_IO_FLAG_MASK) |
+			((__u64)compact_io_decode(off) + (__u64)len));
+}
+
+static void restore_vma_io_apply_copies(struct restore_vma_io *rio)
+{
+	struct restore_vma_copy *copies;
+	unsigned int i;
+
+	if (rio->nr_copies == 0)
+		return;
+
+	copies = restore_vma_io_copies(rio);
+	for (i = 0; i < (unsigned int)rio->nr_copies; i++)
+		memcpy(copies[i].dst, copies[i].src, PAGE_SIZE);
+}
+
 /*
  * Advance restore_vma_io by 'res' bytes consumed. Updates rio in place.
  * Returns the new (iov_ptr, nr_iovs) for resubmission, or 0 if fully done.
@@ -1626,7 +1664,7 @@ static void advance_vma_io_retry(struct restore_vma_io *rio, ssize_t res,
 	unsigned int j = 0;
 
 	remaining = res;
-	rio->off += res;
+	rio->off = compact_io_advance(rio->off, res);
 
 	while (j < rio->nr_iovs && remaining > 0) {
 		size_t len = rio->iovs[j].iov_len;
@@ -1680,19 +1718,21 @@ static int process_aio_event(struct task_restore_args *args, aio_context_t aio_c
 	}
 
 	cb = (struct iocb *)(unsigned long)ev->obj;
+	idx = cb - iocbs;
+	r = rio_ptrs[idx];
 
-	if (args->auto_dedup) {
+	if (args->auto_dedup && !compact_io_is_compact(r->off)) {
 		long fr = sys_fallocate(fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
 					cb->aio_offset, res);
 		if (fr < 0)
 			pr_debug("Failed to punch holes with fallocate: %ld\n", fr);
 	}
 
-	if (res == ev->data)
+	if (res == ev->data) {
+		restore_vma_io_apply_copies(r);
 		return 0;
+	}
 
-	idx = cb - iocbs;
-	r = rio_ptrs[idx];
 	advance_vma_io_retry(r, res, &iov_next, &nr_next);
 	if (!iov_next || nr_next == 0) {
 		pr_err("AIO retry advance produced no work after %zd bytes\n", res);
@@ -1700,7 +1740,7 @@ static int process_aio_event(struct task_restore_args *args, aio_context_t aio_c
 	}
 	cb->aio_buf = (unsigned long)iov_next;
 	cb->aio_nbytes = nr_next;
-	cb->aio_offset = r->off;
+	cb->aio_offset = compact_io_decode(r->off);
 	cb->aio_data -= res;
 	ret2 = sys_io_submit(aio_ctx, 1, &cb);
 	if (ret2 != 1) {
@@ -1813,13 +1853,22 @@ static int restore_vma_preadv(struct task_restore_args *args)
 		int nr = rio->nr_iovs;
 		ssize_t r;
 
+		if (compact_io_is_zero(rio->off)) {
+			int j;
+
+			for (j = 0; j < nr; j++)
+				memset(iovs[j].iov_base, 0, iovs[j].iov_len);
+			restore_vma_io_apply_copies(rio);
+			goto next_rio;
+		}
+
 		while (nr) {
 			pr_debug("Preadv %lx:%d... (%d iovs)\n", (unsigned long)iovs->iov_base, (int)iovs->iov_len, nr);
 			/*
 			 * If we're requested to punch holes in the file after reading we do
 			 * it to save memory. Limit the reads then to an arbitrary block size.
 			 */
-			r = preadv_limited(args->vma_ios_fd, iovs, nr, rio->off,
+			r = preadv_limited(args->vma_ios_fd, iovs, nr, compact_io_decode(rio->off),
 					   args->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
 			if (r < 0) {
 				pr_err("Can't read pages data (%d)\n", (int)r);
@@ -1835,14 +1884,14 @@ static int restore_vma_preadv(struct task_restore_args *args)
 			pr_debug("`- returned %ld\n", (long)r);
 			/* If the file is open for writing, then it means we should punch holes
 			 * in it. */
-			if (args->auto_dedup) {
+			if (args->auto_dedup && !compact_io_is_compact(rio->off)) {
 				int fr = sys_fallocate(args->vma_ios_fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
-						       rio->off, r);
+						       compact_io_decode(rio->off), r);
 				if (fr < 0) {
 					pr_debug("Failed to punch holes with fallocate: %d\n", fr);
 				}
 			}
-			rio->off += r;
+			rio->off = compact_io_advance(rio->off, r);
 			/* Advance the iovecs */
 			do {
 				if (iovs->iov_len <= r) {
@@ -1858,8 +1907,10 @@ static int restore_vma_preadv(struct task_restore_args *args)
 				break;
 			} while (nr > 0);
 		}
+		restore_vma_io_apply_copies(rio);
 
-		rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs));
+next_rio:
+		rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs, rio->nr_copies));
 	}
 
 	if (args->vma_ios_fd != -1)
@@ -1879,6 +1930,7 @@ static int restore_vma_preadv(struct task_restore_args *args)
 static int restore_vma_aio(struct task_restore_args *args)
 {
 	unsigned int n = args->vma_ios_n;
+	unsigned int aio_n = 0;
 	int fd = args->vma_ios_fd;
 	aio_context_t aio_ctx = 0;
 	long aio_ret;
@@ -1892,14 +1944,35 @@ static int restore_vma_aio(struct task_restore_args *args)
 	unsigned int i;
 	int ret = -1;
 
+	rio = args->vma_ios;
+	for (i = 0; i < n; i++) {
+		if (compact_io_is_zero(rio->off)) {
+			int j;
+
+			for (j = 0; j < rio->nr_iovs; j++)
+				memset(rio->iovs[j].iov_base, 0, rio->iovs[j].iov_len);
+			restore_vma_io_apply_copies(rio);
+		} else {
+			aio_n++;
+		}
+
+		rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs, rio->nr_copies));
+	}
+
+	if (aio_n == 0) {
+		sys_close(fd);
+		args->vma_ios_fd = -1;
+		return 0;
+	}
+
 	aio_ret = sys_io_setup(AIO_BATCH, &aio_ctx);
 	if (aio_ret < 0) {
 		pr_err("io_setup(%d) failed: %ld\n", AIO_BATCH, aio_ret);
 		return -1;
 	}
 
-	alloc_sz = n * sizeof(struct iocb) + n * sizeof(struct iocb *) +
-		   n * sizeof(struct restore_vma_io *) +
+	alloc_sz = aio_n * sizeof(struct iocb) + aio_n * sizeof(struct iocb *) +
+		   aio_n * sizeof(struct restore_vma_io *) +
 		   AIO_BATCH * sizeof(struct io_event);
 	iocbs = (void *)sys_mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE,
 				 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1908,17 +1981,23 @@ static int restore_vma_aio(struct task_restore_args *args)
 		sys_io_destroy(aio_ctx);
 		return -1;
 	}
-	iocbps = (struct iocb **)((char *)iocbs + n * sizeof(struct iocb));
-	rio_ptrs = (struct restore_vma_io **)((char *)iocbps + n * sizeof(struct iocb *));
-	events = (struct io_event *)((char *)rio_ptrs + n * sizeof(struct restore_vma_io *));
+	iocbps = (struct iocb **)((char *)iocbs + aio_n * sizeof(struct iocb));
+	rio_ptrs = (struct restore_vma_io **)((char *)iocbps + aio_n * sizeof(struct iocb *));
+	events = (struct io_event *)((char *)rio_ptrs + aio_n * sizeof(struct restore_vma_io *));
 
-	/* Build all iocbs from vma_ios */
+	/* Build iocbs from non-zero vma_ios. */
 	rio = args->vma_ios;
 	for (i = 0; i < n; i++) {
-		struct iocb *cb = &iocbs[i];
+		struct iocb *cb;
 		size_t expected = 0;
 		int j;
 
+		if (compact_io_is_zero(rio->off)) {
+			rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs, rio->nr_copies));
+			continue;
+		}
+
+		cb = &iocbs[completed];
 		for (j = 0; j < rio->nr_iovs; j++)
 			expected += rio->iovs[j].iov_len;
 
@@ -1927,21 +2006,23 @@ static int restore_vma_aio(struct task_restore_args *args)
 		cb->aio_lio_opcode = IOCB_CMD_PREADV;
 		cb->aio_buf = (unsigned long)rio->iovs;
 		cb->aio_nbytes = rio->nr_iovs;
-		cb->aio_offset = rio->off;
+		cb->aio_offset = compact_io_decode(rio->off);
 		/* io_getevents() returns this as event.data for short-read checks. */
 		cb->aio_data = expected;
-		iocbps[i] = cb;
-		rio_ptrs[i] = rio;
+		iocbps[completed] = cb;
+		rio_ptrs[completed] = rio;
+		completed++;
 
-		rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs));
+		rio = (struct restore_vma_io *)((char *)rio + RIO_SIZE(rio->nr_iovs, rio->nr_copies));
 	}
+	completed = 0;
 
 	/* Submit and reap in batches */
-	while (submitted < n || completed < n) {
-		if (submit_aio_batch(aio_ctx, iocbps, n, &submitted, completed) < 0)
+	while (submitted < aio_n || completed < aio_n) {
+		if (submit_aio_batch(aio_ctx, iocbps, aio_n, &submitted, completed) < 0)
 			goto out;
 
-		if (completed >= n)
+		if (completed >= aio_n)
 			continue;
 
 		/*

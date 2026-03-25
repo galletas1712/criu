@@ -940,10 +940,9 @@ err:
 int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
 	unsigned int cur_hole = 0;
+	struct page_pipe_buf *ppb;
 
 	pr_debug("Transferring pages:\n");
-
-	struct page_pipe_buf *ppb;
 
 	list_for_each_entry(ppb, &pp->bufs, l) {
 		if (page_xfer_dump_pages_ppb(xfer, pp, ppb, &cur_hole))

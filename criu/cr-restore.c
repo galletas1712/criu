@@ -170,6 +170,8 @@ struct catch_tasks_stats {
 };
 
 struct restore_tail_stats {
+	u64 wait_sigchld_barrier_us;
+	u64 pre_attach_orchestration_us;
 	u64 wait_creds_barrier_us;
 	u64 catch_tasks_us;
 	u64 stop_on_syscall_us;
@@ -759,6 +761,13 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 {
 	unsigned args_len;
 	struct task_restore_args *ta;
+	u64 total_start_us = restore_tail_now_us();
+	u64 files_us = 0;
+	u64 vma_open_us = 0;
+	u64 task_state_us = 0;
+	u64 mm_vmas_us = 0;
+	u64 net_uffd_us = 0;
+	u64 step_start_us;
 	pr_info("Restoring resources\n");
 
 	rst_mem_switch_to_private();
@@ -770,12 +779,15 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	memzero(ta, args_len);
 
+	step_start_us = restore_tail_now_us();
 	if (prepare_fds(current))
 		return -1;
 
 	if (prepare_file_locks(pid))
 		return -1;
+	files_us = restore_tail_now_us() - step_start_us;
 
+	step_start_us = restore_tail_now_us();
 	if (open_vmas(current))
 		return -1;
 
@@ -787,7 +799,9 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	if (open_cores(pid, core))
 		return -1;
+	vma_open_us = restore_tail_now_us() - step_start_us;
 
+	step_start_us = restore_tail_now_us();
 	if (prepare_signals(pid, ta, core))
 		return -1;
 
@@ -828,17 +842,21 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	if (prepare_itimers(pid, ta, core) < 0)
 		return -1;
+	task_state_us = restore_tail_now_us() - step_start_us;
 
+	step_start_us = restore_tail_now_us();
 	if (prepare_mm(pid, ta))
 		return -1;
 
 	if (prepare_vmas(current, ta))
 		return -1;
+	mm_vmas_us = restore_tail_now_us() - step_start_us;
 
 	/*
 	 * Sockets have to be restored in their network namespaces,
 	 * so a task namespace has to be restored after sockets.
 	 */
+	step_start_us = restore_tail_now_us();
 	if (restore_task_net_ns(current))
 		return -1;
 
@@ -847,6 +865,16 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 
 	if (arch_shstk_prepare(current, core, ta))
 		return -1;
+	net_uffd_us = restore_tail_now_us() - step_start_us;
+
+	pr_info("%d: Restore task setup summary files=%llu ms vma-open=%llu ms state=%llu ms mm-vmas=%llu ms net-uffd=%llu ms total=%llu ms\n",
+		pid,
+		(unsigned long long)(files_us / 1000ULL),
+		(unsigned long long)(vma_open_us / 1000ULL),
+		(unsigned long long)(task_state_us / 1000ULL),
+		(unsigned long long)(mm_vmas_us / 1000ULL),
+		(unsigned long long)(net_uffd_us / 1000ULL),
+		(unsigned long long)((restore_tail_now_us() - total_start_us) / 1000ULL));
 
 	return sigreturn_restore(pid, ta, args_len, core);
 }
@@ -1641,6 +1669,15 @@ static int __restore_task_with_children(void *_arg)
 	struct cr_clone_arg *ca = _arg;
 	pid_t pid;
 	int ret;
+	u64 total_start_us = restore_tail_now_us();
+	u64 mnt_ns_us = 0;
+	u64 prepare_mappings_us = 0;
+	u64 sigactions_us = 0;
+	u64 transport_us = 0;
+	u64 create_children_us = 0;
+	u64 proc_misc_us = 0;
+	u64 stage_wait_us = 0;
+	u64 step_start_us;
 
 	current = ca->item;
 
@@ -1765,30 +1802,41 @@ static int __restore_task_with_children(void *_arg)
 	if (setup_newborn_fds(current))
 		goto err;
 
+	step_start_us = restore_tail_now_us();
 	if (restore_task_mnt_ns(current))
 		goto err;
+	mnt_ns_us = restore_tail_now_us() - step_start_us;
 
+	step_start_us = restore_tail_now_us();
 	if (prepare_mappings(current))
 		goto err;
+	prepare_mappings_us = restore_tail_now_us() - step_start_us;
 
+	step_start_us = restore_tail_now_us();
 	if (prepare_sigactions(ca->core) < 0)
 		goto err;
+	sigactions_us = restore_tail_now_us() - step_start_us;
 
 	if (fault_injected(FI_RESTORE_ROOT_ONLY)) {
 		pr_info("fault: Restore root task failure!\n");
 		kill(getpid(), SIGKILL);
 	}
 
+	step_start_us = restore_tail_now_us();
 	if (open_transport_socket())
 		goto err;
+	transport_us = restore_tail_now_us() - step_start_us;
 
 	timing_start(TIME_FORK);
 
+	step_start_us = restore_tail_now_us();
 	if (create_children_and_session())
 		goto err;
+	create_children_us = restore_tail_now_us() - step_start_us;
 
 	timing_stop(TIME_FORK);
 
+	step_start_us = restore_tail_now_us();
 	if (populate_pid_proc())
 		goto err;
 
@@ -1796,6 +1844,7 @@ static int __restore_task_with_children(void *_arg)
 
 	if (unmap_guard_pages(current))
 		goto err;
+	proc_misc_us = restore_tail_now_us() - step_start_us;
 
 	restore_pgid();
 
@@ -1808,14 +1857,29 @@ static int __restore_task_with_children(void *_arg)
 		 *
 		 * It means that all tasks entered into their namespaces.
 		 */
+		step_start_us = restore_tail_now_us();
 		if (restore_wait_other_tasks())
 			goto err;
+		stage_wait_us = restore_tail_now_us() - step_start_us;
 		fini_restore_mntns();
 		__restore_switch_stage(CR_STATE_RESTORE);
 	} else {
+		step_start_us = restore_tail_now_us();
 		if (restore_finish_stage(task_entries, CR_STATE_FORKING) < 0)
 			goto err;
+		stage_wait_us = restore_tail_now_us() - step_start_us;
 	}
+
+	pr_info("%d: Restore child pre-pie summary mnt-ns=%llu ms premap=%llu ms sigactions=%llu ms transport=%llu ms fork=%llu ms proc=%llu ms stage-wait=%llu ms total=%llu ms\n",
+		vpid(current),
+		(unsigned long long)(mnt_ns_us / 1000ULL),
+		(unsigned long long)(prepare_mappings_us / 1000ULL),
+		(unsigned long long)(sigactions_us / 1000ULL),
+		(unsigned long long)(transport_us / 1000ULL),
+		(unsigned long long)(create_children_us / 1000ULL),
+		(unsigned long long)(proc_misc_us / 1000ULL),
+		(unsigned long long)(stage_wait_us / 1000ULL),
+		(unsigned long long)((restore_tail_now_us() - total_start_us) / 1000ULL));
 
 	if (restore_one_task(vpid(current), ca->core))
 		goto err;
@@ -2390,10 +2454,13 @@ skip_ns_bouncing:
 			task_entries->nr_threads--;
 	}
 
+	step_start_us = restore_tail_now_us();
 	ret = restore_switch_stage(CR_STATE_RESTORE_SIGCHLD);
+	tail_stats.wait_sigchld_barrier_us = restore_tail_now_us() - step_start_us;
 	if (ret < 0)
 		goto out_kill;
 
+	step_start_us = restore_tail_now_us();
 	ret = stop_usernsd();
 	if (ret < 0)
 		goto out_kill;
@@ -2441,6 +2508,7 @@ skip_ns_bouncing:
 	 * may start to exit poking criu in vain.
 	 */
 	ignore_kids();
+	tail_stats.pre_attach_orchestration_us = restore_tail_now_us() - step_start_us;
 
 	/*
 	 * -------------------------------------------------------------
@@ -2448,7 +2516,8 @@ skip_ns_bouncing:
 	 * or a connection.
 	 */
 	step_start_us = restore_tail_now_us();
-	attach_to_tasks(root_seized);
+	if (attach_to_tasks(root_seized))
+		goto out_kill_network_unlocked;
 	tail_stats.attach_to_tasks_us = restore_tail_now_us() - step_start_us;
 
 	step_start_us = restore_tail_now_us();
@@ -2532,7 +2601,9 @@ skip_ns_bouncing:
 		goto out_kill_network_unlocked;
 	tail_stats.finalize_detach_us = restore_tail_now_us() - step_start_us;
 
-	pr_info("Restore master tail summary attach=%llu ms wait-creds=%llu ms catch=%llu ms stop-on-syscall=%llu ms finalize=%llu ms rseq=%llu ms late-hook=%llu ms pre-resume=%llu ms freezer=%llu ms detach=%llu ms catch-threads=%llu catch-interrupt-wait=%llu ms catch-stop-pie=%llu ms\n",
+	pr_info("Restore master tail summary wait-sigchld=%llu ms pre-attach=%llu ms attach=%llu ms wait-creds=%llu ms catch=%llu ms stop-on-syscall=%llu ms finalize=%llu ms rseq=%llu ms late-hook=%llu ms pre-resume=%llu ms freezer=%llu ms detach=%llu ms catch-threads=%llu catch-interrupt-wait=%llu ms catch-stop-pie=%llu ms\n",
+		(unsigned long long)(tail_stats.wait_sigchld_barrier_us / 1000ULL),
+		(unsigned long long)(tail_stats.pre_attach_orchestration_us / 1000ULL),
 		(unsigned long long)(tail_stats.attach_to_tasks_us / 1000ULL),
 		(unsigned long long)(tail_stats.wait_creds_barrier_us / 1000ULL),
 		(unsigned long long)(tail_stats.catch_tasks_us / 1000ULL),

@@ -17,6 +17,7 @@
 #include "servicefd.h"
 #include "image.h"
 #include "page-xfer.h"
+#include "page-coalesce.h"
 #include "page-pipe.h"
 #include "util.h"
 #include "protobuf.h"
@@ -356,6 +357,9 @@ static int write_pagemap_loc(struct page_xfer *xfer, struct iovec *iov, u32 flag
 
 static void close_page_xfer(struct page_xfer *xfer)
 {
+	int fd_type = xfer->fd_type;
+	unsigned long img_id = xfer->img_id;
+
 	if (xfer->parent != NULL) {
 		xfer->parent->close(xfer->parent);
 		xfree(xfer->parent);
@@ -363,6 +367,11 @@ static void close_page_xfer(struct page_xfer *xfer)
 	}
 	close_image(xfer->pi);
 	close_image(xfer->pmi);
+
+	if (!opts.use_page_server && opts.auto_dedup) {
+		if (coalesce_checkpoint_pages_enqueue(fd_type, img_id))
+			pr_err("Can't enqueue pagemap %d/%lu for online coalescing\n", fd_type, img_id);
+	}
 }
 
 static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
@@ -417,6 +426,8 @@ static int open_page_local_xfer(struct page_xfer *xfer, int fd_type, unsigned lo
 	}
 
 out:
+	xfer->fd_type = fd_type;
+	xfer->img_id = img_id;
 	xfer->write_pagemap = write_pagemap_loc;
 	xfer->write_pages = write_pages_loc;
 	xfer->close = close_page_xfer;
@@ -433,6 +444,11 @@ int open_page_xfer(struct page_xfer *xfer, int fd_type, unsigned long img_id)
 {
 	xfer->offset = 0;
 	xfer->transfer_lazy = true;
+
+	if (!opts.use_page_server && opts.auto_dedup) {
+		if (coalesce_checkpoint_pages_start())
+			return -1;
+	}
 
 	if (opts.use_page_server)
 		return open_page_server_xfer(xfer, fd_type, img_id);

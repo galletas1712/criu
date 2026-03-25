@@ -65,6 +65,7 @@
 #include "stats.h"
 #include "mem.h"
 #include "page-pipe.h"
+#include "page-coalesce.h"
 #include "posix-timer.h"
 #include "vdso.h"
 #include "vma.h"
@@ -2051,6 +2052,13 @@ static int cr_dump_finish(int ret)
 
 	if (bfd_flush_images())
 		ret = -1;
+
+	if (!ret) {
+		if (coalesce_checkpoint_pages())
+			ret = -1;
+	} else {
+		coalesce_checkpoint_pages_abort();
+	}
 
 	cgp_fini();
 

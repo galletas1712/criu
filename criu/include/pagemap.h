@@ -69,6 +69,7 @@ struct page_read {
 	/* Private data of reader */
 	struct cr_img *pmi;
 	struct cr_img *pi;
+	struct cr_img *pidx;
 	u32 pages_img_id;
 
 	PagemapEntry *pe;	  /* current pagemap we are on */
@@ -141,6 +142,8 @@ static inline bool page_read_has_parent(struct page_read *pr)
 #define PE_PARENT  (1 << 0) /* pages are in parent snapshot */
 #define PE_LAZY	   (1 << 1) /* pages can be lazily restored */
 #define PE_PRESENT (1 << 2) /* pages are present in pages*img */
+
+#define PAGE_INDEX_ZERO (~(u64)0)
 
 static inline bool pagemap_in_parent(PagemapEntry *pe)
 {

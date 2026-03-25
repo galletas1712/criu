@@ -48,6 +48,7 @@ obj-y			+= netfilter.o
 obj-y			+= net.o
 obj-y			+= pagemap-cache.o
 obj-y			+= page-pipe.o
+obj-y			+= page-coalesce.o
 obj-y			+= pagemap.o
 obj-y			+= page-xfer.o
 obj-y			+= parasite-syscall.o

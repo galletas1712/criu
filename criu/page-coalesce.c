@@ -30,7 +30,12 @@
 #define COALESCE_BATCH_PAGES 16384
 #define COALESCE_WORK_PAGES 128
 #define COALESCE_HASH_MIN_LOAD 4
-#define COALESCE_MAX_THREADS 32
+/*
+ * Hashing saturates before the full host CPU count on current snapshot nodes.
+ * 48 workers materially outperformed 32 in local microbenchmarks, while 64
+ * regressed back to the 32-thread range due to extra wakeup/bandwidth pressure.
+ */
+#define COALESCE_MAX_THREADS 48
 #define COALESCE_INITIAL_SLOTS (1 << 22)
 
 static const unsigned char zero_page[PAGE_SIZE] __attribute__((aligned(64)));

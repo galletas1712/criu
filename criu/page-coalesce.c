@@ -37,7 +37,12 @@
  */
 #define COALESCE_MAX_THREADS 48
 #define COALESCE_INITIAL_SLOTS (1 << 22)
-#define COALESCE_STREAM_QUEUE_DEPTH 2
+/*
+ * A little more queueing lets the page dump pipe keep draining while the
+ * previous chunks are still being hashed/published, without growing per-stream
+ * staging unreasonably.
+ */
+#define COALESCE_STREAM_QUEUE_DEPTH 4
 
 static const unsigned char zero_page[PAGE_SIZE] __attribute__((aligned(64)));
 
@@ -142,7 +147,11 @@ struct coalesce_stats {
 	u64 images;
 	u64 total_us;
 	u64 read_us;
+	u64 queue_wait_us;
+	u64 hash_wait_us;
 	u64 hash_us;
+	u64 group_us;
+	u64 store_wait_us;
 	u64 lookup_us;
 	u64 blob_write_us;
 	u64 index_write_us;
@@ -173,9 +182,12 @@ struct coalesce_worker_state {
 	struct page_store store;
 	struct coalesce_stats stats;
 	int dfd;
+	u64 start_us;
 	bool started;
 	bool stop;
 	bool failed;
+	pthread_mutex_t hash_lock;
+	pthread_mutex_t store_lock;
 };
 
 struct compact_page_stream {
@@ -210,10 +222,16 @@ struct compact_page_stream {
 	u64 local_duplicate_pages;
 	u64 old_bytes;
 	u64 read_us;
+	u64 queue_wait_us;
+	u64 hash_wait_us;
 	u64 hash_us;
+	u64 group_us;
+	u64 store_wait_us;
 	u64 lookup_us;
 	u64 blob_write_us;
 	u64 index_write_us;
+	u64 start_us;
+	unsigned int max_queue_depth;
 };
 
 /* One background worker consumes completed pagemap/pages pairs while dump continues. */
@@ -959,6 +977,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	u64 image_total_us = 0;
 	u64 image_read_us = 0;
 	u64 image_hash_us = 0;
+	u64 image_group_us = 0;
 	u64 image_lookup_us = 0;
 	u64 image_blob_write_us = 0;
 	u64 image_index_write_us = 0;
@@ -1029,6 +1048,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		size_t chunk_bytes = (size_t)chunk_pages * PAGE_SIZE;
 		const char *chunk_pages_ptr = old_pages_map + source_off;
 		u64 *offsets = offset_buffers[current_offsets];
+		u64 group_start_us;
 		u64 lookup_start_us;
 		unsigned int j;
 		unsigned int nr_blob_pages = 0;
@@ -1043,6 +1063,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 			chunk_group_generation = 1;
 		}
 
+		group_start_us = now_us();
 		for (j = 0; j < chunk_pages; j++) {
 			unsigned int group_id;
 			bool is_new;
@@ -1061,6 +1082,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 			if (is_new)
 				chunk_rep_page[group_count++] = j;
 		}
+		image_group_us += now_us() - group_start_us;
 
 		lookup_start_us = now_us();
 		for (j = 0; j < group_count; j++) {
@@ -1150,15 +1172,17 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	stats->total_us += image_total_us;
 	stats->read_us += image_read_us;
 	stats->hash_us += image_hash_us;
+	stats->group_us += image_group_us;
 	stats->lookup_us += image_lookup_us;
 	stats->blob_write_us = store->blob_write_us;
 	stats->index_write_us += image_index_write_us;
 
-	pr_info("Image %u coalesced: present=%llu unique=%llu local_unique=%llu local_dup=%llu zero=%llu total=%llu ms read=%llu ms hash=%llu ms lookup=%llu ms blob=%llu ms index=%llu ms\n",
+	pr_info("Image %u coalesced: present=%llu unique=%llu local_unique=%llu local_dup=%llu zero=%llu wall=%llu ms read=%llu ms hash=%llu ms group=%llu ms lookup=%llu ms blob=%llu ms index=%llu ms\n",
 		pages_id, (unsigned long long)image_present_pages, (unsigned long long)image_unique_pages,
 		(unsigned long long)image_lookup_candidates, (unsigned long long)image_local_duplicate_pages,
 		(unsigned long long)image_zero_pages, (unsigned long long)(image_total_us / 1000ULL),
 		(unsigned long long)(image_read_us / 1000ULL), (unsigned long long)(image_hash_us / 1000ULL),
+		(unsigned long long)(image_group_us / 1000ULL),
 		(unsigned long long)(image_lookup_us / 1000ULL), (unsigned long long)(image_blob_write_us / 1000ULL),
 		(unsigned long long)(image_index_write_us / 1000ULL));
 
@@ -1215,6 +1239,43 @@ static int read_pipe_exact(int pipefd, void *buf, size_t len)
 	return 0;
 }
 
+static int write_blob_iov_at(struct cr_img *blob, const struct iovec *iovecs, unsigned int nr_iovecs, u64 start_offset)
+{
+	int fd = img_raw_fd(blob);
+	off_t offset = (off_t)start_offset;
+	unsigned int i;
+
+	if (fd < 0)
+		return -1;
+
+	for (i = 0; i < nr_iovecs;) {
+		unsigned int batch_iov = nr_iovecs - i;
+		size_t expected = 0;
+		ssize_t written;
+		unsigned int j;
+
+		if (batch_iov > IOV_MAX)
+			batch_iov = IOV_MAX;
+		for (j = 0; j < batch_iov; j++)
+			expected += iovecs[i + j].iov_len;
+
+		written = pwritev(fd, &iovecs[i], batch_iov, offset);
+		if (written < 0) {
+			pr_perror("Can't write streamed coalesced page blob");
+			return -1;
+		}
+		if ((size_t)written != expected) {
+			pr_err("Short write to streamed coalesced page blob: %zd/%zu bytes\n", written, expected);
+			return -1;
+		}
+
+		offset += written;
+		i += batch_iov;
+	}
+
+	return 0;
+}
+
 static void free_compact_page_stream(struct compact_page_stream *stream)
 {
 	unsigned int i;
@@ -1241,24 +1302,19 @@ static void free_compact_page_stream(struct compact_page_stream *stream)
 	xfree(stream);
 }
 
-static int coalesce_stream_chunk_locked(struct compact_page_stream *stream, const char *pages, unsigned int chunk_pages)
+static int coalesce_stream_group_chunk(struct compact_page_stream *stream, unsigned int chunk_pages)
 {
-	struct coalesce_worker_state *state = &online_state;
-	unsigned int nr_blob_pages = 0;
 	unsigned int group_count = 0;
 	unsigned int chunk_nonzero_pages = 0;
-	u64 lookup_start_us;
-	u64 step_start_us;
+	u64 group_start_us;
 	unsigned int j;
-
-	if (hash_pool_run(&state->pool, pages, stream->meta, chunk_pages, &stream->hash_us))
-		return -1;
 
 	if (!stream->chunk_group_generation) {
 		memzero(stream->chunk_groups, stream->chunk_groups_cap * sizeof(*stream->chunk_groups));
 		stream->chunk_group_generation = 1;
 	}
 
+	group_start_us = now_us();
 	for (j = 0; j < chunk_pages; j++) {
 		unsigned int group_id;
 		bool is_new;
@@ -1277,8 +1333,21 @@ static int coalesce_stream_chunk_locked(struct compact_page_stream *stream, cons
 		if (is_new)
 			stream->chunk_rep_page[group_count++] = j;
 	}
+	stream->group_us += now_us() - group_start_us;
+	stream->lookup_candidates += group_count;
+	stream->local_duplicate_pages += chunk_nonzero_pages - group_count;
+	return group_count;
+}
 
-	lookup_start_us = now_us();
+static int coalesce_stream_publish_chunk_locked(struct compact_page_stream *stream, const char *pages, unsigned int chunk_pages,
+						unsigned int group_count, unsigned int *nr_blob_pages, u64 *blob_offset)
+{
+	struct coalesce_worker_state *state = &online_state;
+	u64 lookup_start_us = now_us();
+	unsigned int j;
+
+	*nr_blob_pages = 0;
+	*blob_offset = 0;
 	for (j = 0; j < group_count; j++) {
 		unsigned int rep = stream->chunk_rep_page[j];
 		bool is_new;
@@ -1286,53 +1355,30 @@ static int coalesce_stream_chunk_locked(struct compact_page_stream *stream, cons
 		if (page_store_lookup_or_reserve(&state->store, &stream->meta[rep].key, &stream->chunk_group_offsets[j], &is_new))
 			return -1;
 		if (is_new) {
-			stream->blob_iov[nr_blob_pages].iov_base = (void *)(pages + rep * PAGE_SIZE);
-			stream->blob_iov[nr_blob_pages].iov_len = PAGE_SIZE;
-			nr_blob_pages++;
+			u64 offset = stream->chunk_group_offsets[j];
+
+			if (*nr_blob_pages == 0)
+				*blob_offset = offset;
+			else if (offset != *blob_offset + (u64)(*nr_blob_pages) * PAGE_SIZE) {
+				pr_err("Non-contiguous compact blob offsets for image %u: expected %llu got %llu\n",
+				       stream->pages_id,
+				       (unsigned long long)(*blob_offset + (u64)(*nr_blob_pages) * PAGE_SIZE),
+				       (unsigned long long)offset);
+				return -1;
+			}
+
+			stream->blob_iov[*nr_blob_pages].iov_base = (void *)(pages + rep * PAGE_SIZE);
+			stream->blob_iov[*nr_blob_pages].iov_len = PAGE_SIZE;
+			(*nr_blob_pages)++;
 			stream->unique_pages++;
 		}
 	}
 	stream->lookup_us += now_us() - lookup_start_us;
-	stream->lookup_candidates += group_count;
-	stream->local_duplicate_pages += chunk_nonzero_pages - group_count;
 
 	for (j = 0; j < chunk_pages; j++) {
 		if (!stream->meta[j].zero)
 			stream->offsets[j] = stream->chunk_group_offsets[stream->chunk_group_of_page[j]];
 	}
-
-	if (nr_blob_pages > 0) {
-		u64 blob_write_us;
-
-		step_start_us = now_us();
-		for (j = 0; j < nr_blob_pages;) {
-			unsigned int batch_iov = nr_blob_pages - j;
-			int written;
-
-			if (batch_iov > IOV_MAX)
-				batch_iov = IOV_MAX;
-
-			written = bwritev(&state->store.blob->_x, &stream->blob_iov[j], batch_iov);
-			if (written < 0) {
-				pr_perror("Can't write streamed coalesced page blob");
-				return -1;
-			}
-			if (written != (int)(batch_iov * PAGE_SIZE)) {
-				pr_err("Short write to streamed coalesced page blob: %d/%zu bytes\n", written,
-				       (size_t)batch_iov * PAGE_SIZE);
-				return -1;
-			}
-			j += batch_iov;
-		}
-		blob_write_us = now_us() - step_start_us;
-		stream->blob_write_us += blob_write_us;
-		state->store.blob_write_us += blob_write_us;
-	}
-
-	step_start_us = now_us();
-	if (write_img_buf(stream->index, stream->offsets, chunk_pages * sizeof(*stream->offsets)))
-		return -1;
-	stream->index_write_us += now_us() - step_start_us;
 
 	stream->present_pages += chunk_pages;
 	stream->old_bytes += (u64)chunk_pages * PAGE_SIZE;
@@ -1357,12 +1403,18 @@ static void stop_compact_page_stream_worker(struct compact_page_stream *stream)
 
 static void *compact_stream_worker_main(void *arg)
 {
+	struct coalesce_worker_state *state = &online_state;
 	struct compact_page_stream *stream = arg;
 
 	for (;;) {
+		unsigned int nr_blob_pages = 0;
+		u64 blob_offset = 0;
 		unsigned int slot;
 		unsigned int chunk_pages;
+		int group_count;
 		bool failed = false;
+		u64 step_start_us;
+		u64 blob_write_us = 0;
 
 		pthread_mutex_lock(&stream->lock);
 		while (stream->nr_ready == 0 && !stream->stop && !stream->failed)
@@ -1377,13 +1429,61 @@ static void *compact_stream_worker_main(void *arg)
 		chunk_pages = stream->queued_pages[slot];
 		pthread_mutex_unlock(&stream->lock);
 
-		pthread_mutex_lock(&online_state.lock);
-		if (online_state.failed || coalesce_stream_chunk_locked(stream, stream->pages_buf[slot], chunk_pages)) {
-			online_state.failed = true;
-			failed = true;
-		}
-		pthread_mutex_unlock(&online_state.lock);
+		pthread_mutex_lock(&state->lock);
+		failed = state->failed;
+		pthread_mutex_unlock(&state->lock);
+		if (failed)
+			goto out_fail;
 
+		step_start_us = now_us();
+		pthread_mutex_lock(&state->hash_lock);
+		stream->hash_wait_us += now_us() - step_start_us;
+		if (hash_pool_run(&state->pool, stream->pages_buf[slot], stream->meta, chunk_pages, &stream->hash_us)) {
+			pthread_mutex_unlock(&state->hash_lock);
+			failed = true;
+			goto out_fail;
+		}
+		pthread_mutex_unlock(&state->hash_lock);
+
+		group_count = coalesce_stream_group_chunk(stream, chunk_pages);
+		if (group_count < 0) {
+			failed = true;
+			goto out_fail;
+		}
+
+		step_start_us = now_us();
+		pthread_mutex_lock(&state->store_lock);
+		stream->store_wait_us += now_us() - step_start_us;
+		if (coalesce_stream_publish_chunk_locked(stream, stream->pages_buf[slot], chunk_pages, group_count,
+							 &nr_blob_pages, &blob_offset)) {
+			pthread_mutex_unlock(&state->store_lock);
+			failed = true;
+			goto out_fail;
+		}
+		pthread_mutex_unlock(&state->store_lock);
+
+		if (nr_blob_pages > 0) {
+			step_start_us = now_us();
+			if (write_blob_iov_at(state->store.blob, stream->blob_iov, nr_blob_pages, blob_offset)) {
+				failed = true;
+				goto out_fail;
+			}
+			blob_write_us = now_us() - step_start_us;
+			stream->blob_write_us += blob_write_us;
+
+			pthread_mutex_lock(&state->store_lock);
+			state->store.blob_write_us += blob_write_us;
+			pthread_mutex_unlock(&state->store_lock);
+		}
+
+		step_start_us = now_us();
+		if (write_img_buf(stream->index, stream->offsets, chunk_pages * sizeof(*stream->offsets))) {
+			failed = true;
+			goto out_fail;
+		}
+		stream->index_write_us += now_us() - step_start_us;
+
+out_fail:
 		pthread_mutex_lock(&stream->lock);
 		stream->drain_slot = (stream->drain_slot + 1) % COALESCE_STREAM_QUEUE_DEPTH;
 		stream->nr_ready--;
@@ -1391,6 +1491,13 @@ static void *compact_stream_worker_main(void *arg)
 			stream->failed = true;
 		pthread_cond_broadcast(&stream->space);
 		pthread_mutex_unlock(&stream->lock);
+
+		if (failed) {
+			pthread_mutex_lock(&state->lock);
+			state->failed = true;
+			pthread_cond_broadcast(&state->ready);
+			pthread_mutex_unlock(&state->lock);
+		}
 
 		if (failed)
 			return NULL;
@@ -1438,6 +1545,7 @@ int coalesce_checkpoint_pages_open_stream(u32 pages_id, struct compact_page_stre
 	stream->sync_inited = true;
 	stream->pages_id = pages_id;
 	stream->chunk_group_generation = 1;
+	stream->start_us = now_us();
 	if (pthread_create(&stream->thread, NULL, compact_stream_worker_main, stream) != 0) {
 		pr_err("pthread_create failed for compact page stream worker\n");
 		goto err;
@@ -1471,9 +1579,11 @@ int coalesce_checkpoint_pages_write_stream(struct compact_page_stream *stream, i
 			chunk = (size_t)COALESCE_BATCH_PAGES * PAGE_SIZE;
 		chunk_pages = chunk / PAGE_SIZE;
 
+		step_start_us = now_us();
 		pthread_mutex_lock(&stream->lock);
 		while (stream->nr_ready == COALESCE_STREAM_QUEUE_DEPTH && !stream->failed)
 			pthread_cond_wait(&stream->space, &stream->lock);
+		stream->queue_wait_us += now_us() - step_start_us;
 		if (stream->failed) {
 			pthread_mutex_unlock(&stream->lock);
 			return -1;
@@ -1494,6 +1604,8 @@ int coalesce_checkpoint_pages_write_stream(struct compact_page_stream *stream, i
 		stream->queued_pages[slot] = chunk_pages;
 		stream->fill_slot = (stream->fill_slot + 1) % COALESCE_STREAM_QUEUE_DEPTH;
 		stream->nr_ready++;
+		if (stream->nr_ready > stream->max_queue_depth)
+			stream->max_queue_depth = stream->nr_ready;
 		pthread_cond_signal(&stream->ready);
 		pthread_mutex_unlock(&stream->lock);
 		len -= chunk;
@@ -1506,12 +1618,14 @@ int coalesce_checkpoint_pages_close_stream(struct compact_page_stream *stream)
 {
 	char index_path[PATH_MAX] = {};
 	int ret = 0;
+	u64 wall_us;
 
 	if (!stream)
 		return 0;
 
 	snprintf(index_path, sizeof(index_path), imgset_template[CR_FD_PAGE_INDEX].fmt, stream->pages_id);
 	stop_compact_page_stream_worker(stream);
+	wall_us = now_us() - stream->start_us;
 
 	pthread_mutex_lock(&online_state.lock);
 	if (!stream->failed && !online_state.failed) {
@@ -1520,7 +1634,6 @@ int coalesce_checkpoint_pages_close_stream(struct compact_page_stream *stream)
 			ret = -1;
 		} else {
 			online_state.stats.old_bytes += stream->old_bytes;
-			online_state.stats.blob_bytes = online_state.store.next_offset;
 			online_state.stats.index_bytes += stream->present_pages * sizeof(*stream->offsets);
 			online_state.stats.present_pages += stream->present_pages;
 			online_state.stats.zero_pages += stream->zero_pages;
@@ -1529,22 +1642,32 @@ int coalesce_checkpoint_pages_close_stream(struct compact_page_stream *stream)
 			online_state.stats.local_duplicate_pages += stream->local_duplicate_pages;
 			online_state.stats.images++;
 			online_state.stats.read_us += stream->read_us;
+			online_state.stats.queue_wait_us += stream->queue_wait_us;
+			online_state.stats.hash_wait_us += stream->hash_wait_us;
 			online_state.stats.hash_us += stream->hash_us;
+			online_state.stats.group_us += stream->group_us;
+			online_state.stats.store_wait_us += stream->store_wait_us;
 			online_state.stats.lookup_us += stream->lookup_us;
 			online_state.stats.index_write_us += stream->index_write_us;
-			online_state.stats.blob_write_us = online_state.store.blob_write_us;
 		}
 	} else {
 		ret = -1;
 	}
 	pthread_mutex_unlock(&online_state.lock);
 
-	pr_info("Image %u coalesced inline: present=%llu unique=%llu local_unique=%llu local_dup=%llu zero=%llu read=%llu ms hash=%llu ms lookup=%llu ms blob=%llu ms index=%llu ms\n",
+	pr_info("Image %u coalesced inline: present=%llu unique=%llu local_unique=%llu local_dup=%llu zero=%llu wall=%llu ms queue_wait=%llu ms read=%llu ms hash_wait=%llu ms hash=%llu ms group=%llu ms store_wait=%llu ms lookup=%llu ms blob=%llu ms index=%llu ms queue_max=%u\n",
 		stream->pages_id, (unsigned long long)stream->present_pages, (unsigned long long)stream->unique_pages,
 		(unsigned long long)stream->lookup_candidates, (unsigned long long)stream->local_duplicate_pages,
-		(unsigned long long)stream->zero_pages, (unsigned long long)(stream->read_us / 1000ULL),
-		(unsigned long long)(stream->hash_us / 1000ULL), (unsigned long long)(stream->lookup_us / 1000ULL),
-		(unsigned long long)(stream->blob_write_us / 1000ULL), (unsigned long long)(stream->index_write_us / 1000ULL));
+		(unsigned long long)stream->zero_pages, (unsigned long long)(wall_us / 1000ULL),
+		(unsigned long long)(stream->queue_wait_us / 1000ULL),
+		(unsigned long long)(stream->read_us / 1000ULL),
+		(unsigned long long)(stream->hash_wait_us / 1000ULL),
+		(unsigned long long)(stream->hash_us / 1000ULL),
+		(unsigned long long)(stream->group_us / 1000ULL),
+		(unsigned long long)(stream->store_wait_us / 1000ULL),
+		(unsigned long long)(stream->lookup_us / 1000ULL),
+		(unsigned long long)(stream->blob_write_us / 1000ULL), (unsigned long long)(stream->index_write_us / 1000ULL),
+		stream->max_queue_depth);
 
 	free_compact_page_stream(stream);
 
@@ -1617,6 +1740,9 @@ static int coalesce_worker_init(struct coalesce_worker_state *state)
 
 	pthread_mutex_init(&state->lock, NULL);
 	pthread_cond_init(&state->ready, NULL);
+	pthread_mutex_init(&state->hash_lock, NULL);
+	pthread_mutex_init(&state->store_lock, NULL);
+	state->start_us = now_us();
 	state->started = true;
 	return 0;
 }
@@ -1639,6 +1765,8 @@ static void coalesce_worker_destroy(struct coalesce_worker_state *state)
 	xfree(state->store.slots);
 	compact_image_set_fini(&state->compact);
 	pthread_cond_destroy(&state->ready);
+	pthread_mutex_destroy(&state->store_lock);
+	pthread_mutex_destroy(&state->hash_lock);
 	pthread_mutex_destroy(&state->lock);
 	memzero(state, sizeof(*state));
 	INIT_LIST_HEAD(&state->jobs);
@@ -1781,10 +1909,14 @@ static int coalesce_checkpoint_pages_finish_online(void)
 	}
 
 	if (!ret) {
-		online_state.stats.total_us = online_state.stats.read_us + online_state.stats.hash_us + online_state.stats.lookup_us +
-					      online_state.store.blob_write_us + online_state.stats.index_write_us;
+		u64 accounted_us;
+
+		online_state.stats.total_us = now_us() - online_state.start_us;
 		online_state.stats.blob_write_us = online_state.store.blob_write_us;
 		online_state.stats.blob_bytes = online_state.store.next_offset;
+		accounted_us = online_state.stats.queue_wait_us + online_state.stats.read_us + online_state.stats.hash_wait_us +
+			       online_state.stats.hash_us + online_state.stats.group_us + online_state.stats.store_wait_us +
+			       online_state.stats.lookup_us + online_state.stats.blob_write_us + online_state.stats.index_write_us;
 
 		pr_info("Coalesced %llu present pages across %llu pagemap images into %llu unique non-zero pages, eliding %llu zero pages\n",
 			(unsigned long long)online_state.stats.present_pages, (unsigned long long)online_state.stats.images,
@@ -1798,17 +1930,22 @@ static int coalesce_checkpoint_pages_finish_online(void)
 			(unsigned long long)(online_state.stats.blob_bytes + online_state.stats.index_bytes),
 			(long long)(online_state.stats.old_bytes -
 				   (online_state.stats.blob_bytes + online_state.stats.index_bytes)));
-		pr_info("Coalesce timings: total=%llu ms read=%llu ms hash=%llu ms lookup=%llu ms blob=%llu ms index=%llu ms grow=%llu ms table_used=%zu table_cap=%zu table_load=%llu%% workers=%u batch_pages=%u mode=online\n",
+		pr_info("Coalesce timings: wall=%llu ms accounted=%llu ms queue_wait=%llu ms read=%llu ms hash_wait=%llu ms hash=%llu ms group=%llu ms store_wait=%llu ms lookup=%llu ms blob=%llu ms index=%llu ms grow=%llu ms table_used=%zu table_cap=%zu table_load=%llu%% workers=%u queue_depth=%u batch_pages=%u mode=online\n",
 			(unsigned long long)(online_state.stats.total_us / 1000ULL),
+			(unsigned long long)(accounted_us / 1000ULL),
+			(unsigned long long)(online_state.stats.queue_wait_us / 1000ULL),
 			(unsigned long long)(online_state.stats.read_us / 1000ULL),
+			(unsigned long long)(online_state.stats.hash_wait_us / 1000ULL),
 			(unsigned long long)(online_state.stats.hash_us / 1000ULL),
+			(unsigned long long)(online_state.stats.group_us / 1000ULL),
+			(unsigned long long)(online_state.stats.store_wait_us / 1000ULL),
 			(unsigned long long)(online_state.stats.lookup_us / 1000ULL),
 			(unsigned long long)(online_state.stats.blob_write_us / 1000ULL),
 			(unsigned long long)(online_state.stats.index_write_us / 1000ULL),
 			(unsigned long long)(online_state.store.grow_us / 1000ULL), online_state.store.used,
 			online_state.store.cap,
 			(unsigned long long)(online_state.store.cap ? (online_state.store.used * 100ULL / online_state.store.cap) : 0),
-			online_state.pool.nr_threads, COALESCE_BATCH_PAGES);
+			online_state.pool.nr_threads, COALESCE_STREAM_QUEUE_DEPTH, COALESCE_BATCH_PAGES);
 	}
 	if (ret)
 		cleanup_compact_sidecars(online_state.dfd, &online_state.compact);
@@ -1902,9 +2039,10 @@ static int coalesce_checkpoint_pages_postpass(void)
 		(unsigned long long)stats.index_bytes,
 		(unsigned long long)(stats.blob_bytes + stats.index_bytes),
 		(long long)(stats.old_bytes - (stats.blob_bytes + stats.index_bytes)));
-	pr_info("Coalesce timings: total=%llu ms read=%llu ms hash=%llu ms lookup=%llu ms blob=%llu ms index=%llu ms grow=%llu ms table_used=%zu table_cap=%zu table_load=%llu%% workers=%u batch_pages=%u\n",
+	pr_info("Coalesce timings: wall=%llu ms read=%llu ms hash=%llu ms group=%llu ms lookup=%llu ms blob=%llu ms index=%llu ms grow=%llu ms table_used=%zu table_cap=%zu table_load=%llu%% workers=%u batch_pages=%u\n",
 		(unsigned long long)(stats.total_us / 1000ULL), (unsigned long long)(stats.read_us / 1000ULL),
-		(unsigned long long)(stats.hash_us / 1000ULL), (unsigned long long)(stats.lookup_us / 1000ULL),
+		(unsigned long long)(stats.hash_us / 1000ULL), (unsigned long long)(stats.group_us / 1000ULL),
+		(unsigned long long)(stats.lookup_us / 1000ULL),
 		(unsigned long long)(stats.blob_write_us / 1000ULL), (unsigned long long)(stats.index_write_us / 1000ULL),
 		(unsigned long long)(store.grow_us / 1000ULL), store.used, store.cap,
 		(unsigned long long)(store.cap ? (store.used * 100ULL / store.cap) : 0), pool.nr_threads, COALESCE_BATCH_PAGES);

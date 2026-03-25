@@ -106,6 +106,78 @@ int __attribute__((weak)) arch_set_thread_regs(struct pstree_item *item, bool wi
 #define PERSONALITY_LENGTH 9
 static char loc_buf[PERSONALITY_LENGTH];
 
+static u64 dump_now_us(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return (u64)tv.tv_sec * 1000000ULL + (u64)tv.tv_usec;
+}
+
+struct dump_task_profile {
+	u64 start_us;
+	u64 parse_stat_us;
+	u64 collect_mappings_us;
+	u64 collect_fds_us;
+	u64 parse_timers_us;
+	u64 dump_signals_us;
+	u64 dump_rseq_us;
+	u64 infect_us;
+	u64 fixup_rseq_us;
+	u64 vdso_us;
+	u64 aios_us;
+	u64 misc_us;
+	u64 imgset_us;
+	u64 ids_us;
+	u64 files_us;
+	u64 eventpoll_us;
+	u64 pages_us;
+	u64 sigacts_us;
+	u64 itimers_us;
+	u64 posix_timers_us;
+	u64 core_us;
+	u64 cgroup_us;
+	u64 stop_daemon_us;
+	u64 threads_us;
+	u64 cure_us;
+	u64 mm_us;
+	u64 fs_us;
+};
+
+static void dump_task_profile_log(pid_t pid, const char *comm, const struct dump_task_profile *profile, int ret)
+{
+	u64 total_us = dump_now_us() - profile->start_us;
+
+	pr_info("Dump task profile pid=%d comm=%s total=%llu ms stat=%llu ms mappings=%llu ms fds=%llu ms timers=%llu ms signals=%llu ms rseq=%llu ms infect=%llu ms fixup_rseq=%llu ms vdso=%llu ms aios=%llu ms misc=%llu ms imgset=%llu ms ids=%llu ms files=%llu ms eventpoll=%llu ms pages=%llu ms sigacts=%llu ms itimers=%llu ms posix_timers=%llu ms core=%llu ms cgroup=%llu ms stop_daemon=%llu ms threads=%llu ms cure=%llu ms mm=%llu ms fs=%llu ms result=%d\n",
+		pid, comm, (unsigned long long)(total_us / 1000ULL),
+		(unsigned long long)(profile->parse_stat_us / 1000ULL),
+		(unsigned long long)(profile->collect_mappings_us / 1000ULL),
+		(unsigned long long)(profile->collect_fds_us / 1000ULL),
+		(unsigned long long)(profile->parse_timers_us / 1000ULL),
+		(unsigned long long)(profile->dump_signals_us / 1000ULL),
+		(unsigned long long)(profile->dump_rseq_us / 1000ULL),
+		(unsigned long long)(profile->infect_us / 1000ULL),
+		(unsigned long long)(profile->fixup_rseq_us / 1000ULL),
+		(unsigned long long)(profile->vdso_us / 1000ULL),
+		(unsigned long long)(profile->aios_us / 1000ULL),
+		(unsigned long long)(profile->misc_us / 1000ULL),
+		(unsigned long long)(profile->imgset_us / 1000ULL),
+		(unsigned long long)(profile->ids_us / 1000ULL),
+		(unsigned long long)(profile->files_us / 1000ULL),
+		(unsigned long long)(profile->eventpoll_us / 1000ULL),
+		(unsigned long long)(profile->pages_us / 1000ULL),
+		(unsigned long long)(profile->sigacts_us / 1000ULL),
+		(unsigned long long)(profile->itimers_us / 1000ULL),
+		(unsigned long long)(profile->posix_timers_us / 1000ULL),
+		(unsigned long long)(profile->core_us / 1000ULL),
+		(unsigned long long)(profile->cgroup_us / 1000ULL),
+		(unsigned long long)(profile->stop_daemon_us / 1000ULL),
+		(unsigned long long)(profile->threads_us / 1000ULL),
+		(unsigned long long)(profile->cure_us / 1000ULL),
+		(unsigned long long)(profile->mm_us / 1000ULL),
+		(unsigned long long)(profile->fs_us / 1000ULL), ret);
+}
+
 void free_mappings(struct vm_area_list *vma_area_list)
 {
 	struct vma_area *vma_area, *p;
@@ -1557,6 +1629,7 @@ err_cure:
 static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 {
 	pid_t pid = item->pid->real;
+	const char *comm = __task_comm_info(pid);
 	struct vm_area_list vmas;
 	struct parasite_ctl *parasite_ctl;
 	int ret, exit_code = -1;
@@ -1565,11 +1638,15 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	struct parasite_drain_fd *dfds = NULL;
 	struct proc_posix_timers_stat proc_args;
 	struct mem_dump_ctl mdc;
+	struct dump_task_profile profile = {
+		.start_us = dump_now_us(),
+	};
+	u64 step_start_us;
 
 	vm_area_list_init(&vmas);
 
 	pr_info("========================================\n");
-	pr_info("Dumping task (pid: %d comm: %s)\n", pid, __task_comm_info(pid));
+	pr_info("Dumping task (pid: %d comm: %s)\n", pid, comm);
 	pr_info("========================================\n");
 
 	if (item->pid->state == TASK_DEAD)
@@ -1579,11 +1656,15 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		return 0;
 
 	pr_info("Obtaining task stat ... \n");
+	step_start_us = dump_now_us();
 	ret = parse_pid_stat(pid, &pps_buf);
+	profile.parse_stat_us += dump_now_us() - step_start_us;
 	if (ret < 0)
 		goto err;
 
+	step_start_us = dump_now_us();
 	ret = collect_mappings(pid, &vmas, dump_filemap);
+	profile.collect_mappings_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Collect mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
@@ -1594,7 +1675,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		if (!dfds)
 			goto err;
 
+		step_start_us = dump_now_us();
 		ret = collect_fds(pid, &dfds);
+		profile.collect_fds_us += dump_now_us() - step_start_us;
 		if (ret) {
 			pr_err("Collect fds (pid: %d) failed with %d\n", pid, ret);
 			goto err;
@@ -1603,7 +1686,9 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		parasite_ensure_args_size(drain_fds_size(dfds));
 	}
 
+	step_start_us = dump_now_us();
 	ret = parse_posix_timers(pid, &proc_args);
+	profile.parse_timers_us += dump_now_us() - step_start_us;
 	if (ret < 0) {
 		pr_err("Can't read posix timers file (pid: %d)\n", pid);
 		goto err;
@@ -1611,25 +1696,33 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 
 	parasite_ensure_args_size(posix_timers_dump_size(proc_args.timer_n));
 
+	step_start_us = dump_now_us();
 	ret = dump_task_signals(pid, item);
+	profile.dump_signals_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Dump %d signals failed %d\n", pid, ret);
 		goto err;
 	}
 
+	step_start_us = dump_now_us();
 	ret = dump_task_rseq(pid, item);
+	profile.dump_rseq_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Dump %d rseq failed %d\n", pid, ret);
 		goto err;
 	}
 
+	step_start_us = dump_now_us();
 	parasite_ctl = parasite_infect_seized(pid, item, &vmas);
+	profile.infect_us += dump_now_us() - step_start_us;
 	if (!parasite_ctl) {
 		pr_err("Can't infect (pid: %d) with parasite\n", pid);
 		goto err;
 	}
 
+	step_start_us = dump_now_us();
 	ret = fixup_thread_rseq(item, 0);
+	profile.fixup_rseq_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Fixup rseq for %d failed %d\n", pid, ret);
 		goto err;
@@ -1653,19 +1746,25 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 			goto err_cure;
 	}
 
+	step_start_us = dump_now_us();
 	ret = parasite_fixup_vdso(parasite_ctl, pid, &vmas);
+	profile.vdso_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Can't fixup vdso VMAs (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
+	step_start_us = dump_now_us();
 	ret = parasite_collect_aios(parasite_ctl, &vmas); /* FIXME -- merge with above */
+	profile.aios_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Failed to check aio rings (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
+	step_start_us = dump_now_us();
 	ret = parasite_dump_misc_seized(parasite_ctl, &misc);
+	profile.misc_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Can't dump misc (pid: %d)\n", pid);
 		goto err_cure;
@@ -1683,23 +1782,31 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 		goto err_cure;
 	}
 
+	step_start_us = dump_now_us();
 	cr_imgset = cr_task_imgset_open(vpid(item), O_DUMP);
+	profile.imgset_us += dump_now_us() - step_start_us;
 	if (!cr_imgset)
 		goto err_cure;
 
+	step_start_us = dump_now_us();
 	ret = dump_task_ids(item, cr_imgset);
+	profile.ids_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Dump ids (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
 	}
 
 	if (dfds) {
+		step_start_us = dump_now_us();
 		ret = dump_task_files_seized(parasite_ctl, item, dfds);
+		profile.files_us += dump_now_us() - step_start_us;
 		if (ret) {
 			pr_err("Dump files (pid: %d) failed with %d\n", pid, ret);
 			goto err_cure;
 		}
+		step_start_us = dump_now_us();
 		ret = flush_eventpoll_dinfo_queue();
+		profile.eventpoll_us += dump_now_us() - step_start_us;
 		if (ret) {
 			pr_err("Dump eventpoll (pid: %d) failed with %d\n", pid, ret);
 			goto err_cure;
@@ -1711,47 +1818,63 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	mdc.stat = &pps_buf;
 	mdc.parent_ie = parent_ie;
 
+	step_start_us = dump_now_us();
 	ret = parasite_dump_pages_seized(item, &vmas, &mdc, parasite_ctl);
+	profile.pages_us += dump_now_us() - step_start_us;
 	if (ret)
 		goto err_cure;
 
+	step_start_us = dump_now_us();
 	ret = parasite_dump_sigacts_seized(parasite_ctl, item);
+	profile.sigacts_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Can't dump sigactions (pid: %d) with parasite\n", pid);
 		goto err_cure;
 	}
 
+	step_start_us = dump_now_us();
 	ret = parasite_dump_itimers_seized(parasite_ctl, item);
+	profile.itimers_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Can't dump itimers (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
+	step_start_us = dump_now_us();
 	ret = parasite_dump_posix_timers_seized(&proc_args, parasite_ctl, item);
+	profile.posix_timers_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Can't dump posix timers (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
+	step_start_us = dump_now_us();
 	ret = dump_task_core_all(parasite_ctl, item, &pps_buf, cr_imgset, &misc);
+	profile.core_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Dump core (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
 	}
 
+	step_start_us = dump_now_us();
 	ret = dump_task_cgroup(parasite_ctl, item);
+	profile.cgroup_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Dump cgroup of threads in process (pid: %d) failed with %d\n", pid, ret);
 		goto err_cure;
 	}
 
+	step_start_us = dump_now_us();
 	ret = compel_stop_daemon(parasite_ctl);
+	profile.stop_daemon_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Can't stop daemon in parasite (pid: %d)\n", pid);
 		goto err_cure;
 	}
 
+	step_start_us = dump_now_us();
 	ret = dump_task_threads(parasite_ctl, item);
+	profile.threads_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Can't dump threads\n");
 		goto err_cure;
@@ -1761,22 +1884,29 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	 * On failure local map will be cured in cr_dump_finish()
 	 * for lazy pages.
 	 */
-	if (opts.lazy_pages)
+	step_start_us = dump_now_us();
+	if (opts.lazy_pages) {
 		ret = compel_cure_remote(parasite_ctl);
-	else
+	} else {
 		ret = compel_cure(parasite_ctl);
+	}
+	profile.cure_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Can't cure (pid: %d) from parasite\n", pid);
 		goto err;
 	}
 
+	step_start_us = dump_now_us();
 	ret = dump_task_mm(pid, &pps_buf, &misc, &vmas, cr_imgset);
+	profile.mm_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Dump mappings (pid: %d) failed with %d\n", pid, ret);
 		goto err;
 	}
 
+	step_start_us = dump_now_us();
 	ret = dump_task_fs(pid, &misc, cr_imgset);
+	profile.fs_us += dump_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Dump fs (pid: %d) failed with %d\n", pid, ret);
 		goto err;
@@ -1784,6 +1914,7 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 
 	exit_code = 0;
 err:
+	dump_task_profile_log(pid, comm, &profile, exit_code);
 	close_cr_imgset(&cr_imgset);
 	close_pid_proc();
 	free_mappings(&vmas);

@@ -9,6 +9,10 @@
 #include <sys/uio.h>
 #include <limits.h>
 
+#include <linux/aio_abi.h>
+
+#include "compel/plugins/std/syscall.h"
+
 #include "types.h"
 #include "image.h"
 #include "cr_options.h"
@@ -54,6 +58,17 @@ struct compact_page_group {
 	u64 off;
 	void **dsts;
 	unsigned int nr_dsts;
+};
+
+struct compact_aio_job {
+	struct page_read_iov *piov;
+	struct iocb iocb;
+	struct iovec *iovs_base;
+	struct iovec *iovs;
+	off_t file_from;
+	size_t remaining;
+	size_t expected;
+	unsigned int nr;
 };
 
 static inline bool compact_io_is_zero(off_t off);
@@ -206,6 +221,280 @@ static int direct_read_iovecs(struct page_read *pr, int fd, off_t off, struct io
 		off += bytes;
 		len -= bytes;
 	}
+}
+
+static void free_compact_aio_jobs(struct compact_aio_job *jobs, unsigned int nr_jobs)
+{
+	unsigned int i;
+
+	for (i = 0; i < nr_jobs; i++)
+		xfree(jobs[i].iovs_base);
+	xfree(jobs);
+}
+
+static int process_compact_async_reads_aio(struct page_read *pr, int fd, u64 sort_us, u64 merge_us,
+					   unsigned int queue_jobs, unsigned int merged_jobs, unsigned long fadv_ms)
+{
+	struct compact_aio_job *jobs = NULL;
+	struct page_read_iov *piov;
+	struct page_read_iov *n;
+	struct io_event *events = NULL;
+	struct iocb *iocbs = NULL;
+	struct iocb **iocbps = NULL;
+	aio_context_t aio_ctx = 0;
+	size_t zero_bytes = 0;
+	size_t zero_skip_bytes = 0;
+	size_t copy_bytes = 0;
+	size_t read_bytes = 0;
+	unsigned int zero_ios = 0;
+	unsigned int zero_skip_ios = 0;
+	unsigned int copy_ios = 0;
+	unsigned int read_ios = 0;
+	unsigned int short_reads = 0;
+	unsigned int max_iovs = 0;
+	unsigned int max_copies = 0;
+	unsigned int aio_n = 0;
+	unsigned int submitted = 0;
+	unsigned int completed = 0;
+	unsigned int aio_submit_calls = 0;
+	unsigned int aio_getevents_calls = 0;
+	unsigned int aio_retry_submits = 0;
+	unsigned int max_inflight = 0;
+	unsigned int i;
+	unsigned long aio_submit_us = 0;
+	unsigned long aio_wait_us = 0;
+	u64 copy_us = 0;
+	struct timeval copy0, copy1, stamp0, stamp1, aio_tv0, aio_tv1;
+	size_t alloc_sz;
+	int ret = 1;
+	bool aio_ctx_ready = false;
+	bool iocbs_mapped = false;
+
+#define COMPACT_AIO_BATCH 256
+
+	if (!pr->pidx || pr->use_direct || opts.auto_dedup || merged_jobs < 2)
+		return 1;
+
+	list_for_each_entry(piov, &pr->async, l) {
+		size_t remaining = (size_t)(piov->end - piov->from);
+
+		if (compact_io_is_zero(piov->from)) {
+			unsigned int j;
+
+			if (compact_io_is_zero_skip(piov->from)) {
+				zero_skip_bytes += remaining;
+				zero_skip_ios++;
+			} else {
+				for (j = 0; j < piov->nr; j++)
+					memset(piov->to[j].iov_base, 0, piov->to[j].iov_len);
+				zero_bytes += remaining;
+				zero_ios++;
+			}
+			continue;
+		}
+
+		aio_n++;
+		if (piov->nr > max_iovs)
+			max_iovs = piov->nr;
+		if (piov->nr_copies > max_copies)
+			max_copies = piov->nr_copies;
+		read_bytes += remaining;
+		read_ios++;
+	}
+
+	if (aio_n == 0) {
+		list_for_each_entry_safe(piov, n, &pr->async, l) {
+			list_del(&piov->l);
+			free_page_read_iov(piov);
+		}
+		pr_info("pagemap async aio sort %lu ms merge %lu ms jobs %u->%u zero-skip %zu MiB (%u ios) zero-fill 0 ms (%zu MiB, %u ios) copy 0 ms (0 MiB, 0 ios) read 0 MiB (0 ios, 0 short, max 0 iovs, max 0 copies)\n",
+			(unsigned long)(sort_us / 1000ULL), (unsigned long)(merge_us / 1000ULL), queue_jobs, merged_jobs,
+			zero_skip_bytes / (1024 * 1024), zero_skip_ios, zero_bytes / (1024 * 1024), zero_ios);
+		free_compact_aio_jobs(jobs, aio_n);
+		return 0;
+	}
+
+	jobs = xzalloc(aio_n * sizeof(*jobs));
+	if (!jobs)
+		goto out;
+
+	i = 0;
+	list_for_each_entry(piov, &pr->async, l) {
+		size_t remaining = (size_t)(piov->end - piov->from);
+
+		if (compact_io_is_zero(piov->from))
+			continue;
+
+		jobs[i].piov = piov;
+		jobs[i].file_from = compact_io_decode(piov->from);
+		jobs[i].remaining = remaining;
+		jobs[i].expected = remaining;
+		jobs[i].nr = piov->nr;
+		jobs[i].iovs_base = xmalloc(piov->nr * sizeof(*jobs[i].iovs_base));
+		if (!jobs[i].iovs_base)
+			goto out;
+		jobs[i].iovs = jobs[i].iovs_base;
+		memcpy(jobs[i].iovs, piov->to, piov->nr * sizeof(*jobs[i].iovs));
+		memset(&jobs[i].iocb, 0, sizeof(jobs[i].iocb));
+		jobs[i].iocb.aio_fildes = fd;
+		jobs[i].iocb.aio_lio_opcode = IOCB_CMD_PREADV;
+		jobs[i].iocb.aio_buf = (unsigned long)jobs[i].iovs;
+		jobs[i].iocb.aio_nbytes = jobs[i].nr;
+		jobs[i].iocb.aio_offset = jobs[i].file_from;
+		jobs[i].iocb.aio_data = jobs[i].expected;
+		i++;
+	}
+
+	if (sys_io_setup(COMPACT_AIO_BATCH, &aio_ctx) < 0) {
+		pr_warn("io_setup(%d) failed, falling back to buffered compact restore\n", COMPACT_AIO_BATCH);
+		goto out;
+	}
+	aio_ctx_ready = true;
+
+	alloc_sz = aio_n * sizeof(*iocbs) + aio_n * sizeof(*iocbps) + COMPACT_AIO_BATCH * sizeof(*events);
+	iocbs = (void *)sys_mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (IS_ERR(iocbs)) {
+		pr_warn("Can't mmap compact AIO buffers: %ld\n", PTR_ERR(iocbs));
+		goto out;
+	}
+	iocbs_mapped = true;
+
+	iocbps = (struct iocb **)((void *)iocbs + aio_n * sizeof(*iocbs));
+	events = (struct io_event *)((void *)iocbps + aio_n * sizeof(*iocbps));
+	for (i = 0; i < aio_n; i++)
+		iocbps[i] = &jobs[i].iocb;
+
+	sys_gettimeofday(&aio_tv0, NULL);
+	while (submitted < aio_n || completed < aio_n) {
+		while (submitted < aio_n && (submitted - completed) < COMPACT_AIO_BATCH) {
+			unsigned int batch = aio_n - submitted;
+
+			if (batch > COMPACT_AIO_BATCH - (submitted - completed))
+				batch = COMPACT_AIO_BATCH - (submitted - completed);
+
+			sys_gettimeofday(&stamp0, NULL);
+			ret = sys_io_submit(aio_ctx, batch, &iocbps[submitted]);
+			sys_gettimeofday(&stamp1, NULL);
+			aio_submit_us += (unsigned long)timeval_delta_us(&stamp0, &stamp1);
+			if (ret <= 0) {
+				pr_warn("compact io_submit failed: %d (submitted %u/%u), falling back to buffered compact restore\n",
+					ret, submitted, aio_n);
+				goto out;
+			}
+			aio_submit_calls++;
+			submitted += ret;
+			if (submitted - completed > max_inflight)
+				max_inflight = submitted - completed;
+		}
+
+		if (completed < aio_n) {
+			struct iocb *cb;
+			struct compact_aio_job *job;
+			long event_nr;
+
+			sys_gettimeofday(&stamp0, NULL);
+			event_nr = sys_io_getevents(aio_ctx, 1, COMPACT_AIO_BATCH, events, NULL);
+			sys_gettimeofday(&stamp1, NULL);
+			aio_wait_us += (unsigned long)timeval_delta_us(&stamp0, &stamp1);
+			if (event_nr <= 0) {
+				pr_warn("compact io_getevents failed: %ld, falling back to buffered compact restore\n", event_nr);
+				goto out;
+			}
+			aio_getevents_calls++;
+
+			for (long k = 0; k < event_nr; k++) {
+				unsigned int idx;
+				struct iovec *iov_next;
+				unsigned int nr_next;
+
+				cb = (struct iocb *)(unsigned long)events[k].obj;
+				idx = cb - &jobs[0].iocb;
+				job = &jobs[idx];
+
+				if (events[k].res < 0) {
+					pr_warn("compact AIO read failed: %lld, falling back to buffered compact restore\n",
+						events[k].res);
+					goto out;
+				}
+				if (events[k].res == 0) {
+					pr_warn("compact AIO zero read (expected %llu), falling back to buffered compact restore\n",
+						job->expected);
+					goto out;
+				}
+
+				if ((size_t)events[k].res == job->remaining) {
+					if (job->piov->nr_copies > 0) {
+						gettimeofday(&copy0, NULL);
+						for (unsigned int j = 0; j < job->piov->nr_copies; j++)
+							memcpy(job->piov->copies[j].dst, job->piov->copies[j].src, PAGE_SIZE);
+						gettimeofday(&copy1, NULL);
+						copy_us += (u64)(copy1.tv_sec - copy0.tv_sec) * 1000000ULL +
+							   (u64)(copy1.tv_usec - copy0.tv_usec);
+						copy_bytes += (size_t)job->piov->nr_copies * PAGE_SIZE;
+						copy_ios += job->piov->nr_copies;
+					}
+					completed++;
+					continue;
+				}
+
+				short_reads++;
+				advance_iovecs(&job->iovs, &job->nr, events[k].res);
+				job->file_from += events[k].res;
+				job->remaining -= events[k].res;
+				iov_next = job->iovs;
+				nr_next = job->nr;
+				job->iocb.aio_buf = (unsigned long)iov_next;
+				job->iocb.aio_nbytes = nr_next;
+				job->iocb.aio_offset = job->file_from;
+				job->iocb.aio_data = job->remaining;
+				sys_gettimeofday(&stamp0, NULL);
+				ret = sys_io_submit(aio_ctx, 1, &cb);
+				sys_gettimeofday(&stamp1, NULL);
+				aio_submit_us += (unsigned long)timeval_delta_us(&stamp0, &stamp1);
+				if (ret != 1) {
+					pr_warn("compact AIO retry submit failed: %d, falling back to buffered compact restore\n", ret);
+					goto out;
+				}
+				aio_submit_calls++;
+				aio_retry_submits++;
+			}
+		}
+	}
+
+	ret = 0;
+	sys_gettimeofday(&aio_tv1, NULL);
+	sys_io_destroy(aio_ctx);
+	sys_munmap(iocbs, alloc_sz);
+	pr_info("pagemap async aio sort %lu ms merge %lu ms jobs %u->%u fadvise %lu ms aio %lu ms (submit %lu ms wait %lu ms, %u submits %u gets %u short %u resubmit, max inflight %u) zero-skip %zu MiB (%u ios) zero-fill %zu MiB (%u ios) copy %lu ms (%zu MiB, %u ios) read %zu MiB (%u ios, %u short, max %u iovs, max %u copies) (range %zu MiB)\n",
+		(unsigned long)(sort_us / 1000ULL), (unsigned long)(merge_us / 1000ULL), queue_jobs, merged_jobs,
+		fadv_ms,
+		(unsigned long)(timeval_delta_us(&aio_tv0, &aio_tv1) / 1000ULL),
+		(unsigned long)(aio_submit_us / 1000ULL),
+		(unsigned long)(aio_wait_us / 1000ULL),
+		aio_submit_calls, aio_getevents_calls, short_reads, aio_retry_submits, max_inflight,
+		zero_skip_bytes / (1024 * 1024), zero_skip_ios,
+		zero_bytes / (1024 * 1024), zero_ios,
+		(unsigned long)(copy_us / 1000ULL), copy_bytes / (1024 * 1024), copy_ios,
+		read_bytes / (1024 * 1024), read_ios, short_reads, max_iovs, max_copies,
+		(size_t)((jobs[aio_n - 1].file_from + jobs[aio_n - 1].expected - jobs[0].file_from) / (1024 * 1024)));
+
+	list_for_each_entry_safe(piov, n, &pr->async, l) {
+		list_del(&piov->l);
+		free_page_read_iov(piov);
+	}
+
+	free_compact_aio_jobs(jobs, aio_n);
+	return 0;
+
+out:
+	if (aio_ctx_ready)
+		sys_io_destroy(aio_ctx);
+	if (iocbs_mapped)
+		sys_munmap(iocbs, alloc_sz);
+	free_compact_aio_jobs(jobs, aio_n);
+	return 1;
+
+#undef COMPACT_AIO_BATCH
 }
 
 static int compact_page_ref_cmp(const void *a, const void *b)
@@ -1589,6 +1878,16 @@ static int process_async_reads(struct page_read *pr)
 			pr_debug("posix_fadvise(WILLNEED) failed for async range\n");
 	}
 	gettimeofday(&tv1, NULL);
+	{
+		unsigned long compact_fadv_ms = (unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000);
+
+		/* Try compact AIO first; if it cannot make progress, fall back to the existing sync path. */
+		if (process_compact_async_reads_aio(pr, fd, sort_us, merge_us, queue_jobs, merged_jobs, compact_fadv_ms) == 0) {
+			if (pr->parent)
+				ret = process_async_reads(pr->parent);
+			return ret;
+		}
+	}
 	list_for_each_entry_safe(piov, n, &pr->async, l) {
 		ssize_t bytes;
 		bool io_failed = false;

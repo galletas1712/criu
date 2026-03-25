@@ -16,6 +16,7 @@
 #include <sys/shm.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/time.h>
 #include <sched.h>
 #include <linux/elf.h>
 
@@ -153,6 +154,33 @@ static inline int stage_participants(int next_stage)
 	BUG();
 	return -1;
 }
+
+static inline u64 restore_tail_now_us(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return (u64)tv.tv_sec * 1000000ULL + (u64)tv.tv_usec;
+}
+
+struct catch_tasks_stats {
+	u64 threads;
+	u64 interrupt_wait_us;
+	u64 stop_pie_us;
+};
+
+struct restore_tail_stats {
+	u64 wait_creds_barrier_us;
+	u64 catch_tasks_us;
+	u64 stop_on_syscall_us;
+	u64 finalize_restore_us;
+	u64 restore_rseq_cs_us;
+	u64 late_hook_us;
+	u64 pre_resume_us;
+	u64 restore_freezer_us;
+	u64 finalize_detach_us;
+	struct catch_tasks_stats catch_tasks;
+};
 
 static inline int stage_current_participants(int next_stage)
 {
@@ -1817,7 +1845,7 @@ static int restore_rseq_cs(void)
 	return 0;
 }
 
-static int catch_tasks(bool root_seized)
+static int catch_tasks(bool root_seized, struct catch_tasks_stats *stats)
 {
 	struct pstree_item *item;
 	bool nobp = fault_injected(FI_NO_BREAKPOINTS) || !kdat.has_breakpoints;
@@ -1831,20 +1859,29 @@ static int catch_tasks(bool root_seized)
 		/* threads[] populated by attach_to_tasks; no re-parse needed */
 		for (i = 0; i < item->nr_threads; i++) {
 			pid_t pid = item->threads[i].real;
+			u64 step_start_us;
 
 			if (ptrace(PTRACE_INTERRUPT, pid, 0, 0)) {
 				pr_perror("Can't interrupt the %d task", pid);
 				return -1;
 			}
 
+			step_start_us = restore_tail_now_us();
 			if (wait4(pid, &status, __WALL, NULL) != pid) {
 				pr_perror("waitpid(%d) failed", pid);
 				return -1;
 			}
+			if (stats) {
+				stats->threads++;
+				stats->interrupt_wait_us += restore_tail_now_us() - step_start_us;
+			}
 
+			step_start_us = restore_tail_now_us();
 			ret = compel_stop_pie(pid, rsti(item)->breakpoint, nobp);
 			if (ret < 0)
 				return -1;
+			if (stats)
+				stats->stop_pie_us += restore_tail_now_us() - step_start_us;
 		}
 	}
 
@@ -2005,6 +2042,8 @@ static int restore_root_task(struct pstree_item *init)
 	int ret, fd, mnt_ns_fd = -1;
 	int root_seized = 0;
 	struct pstree_item *item;
+	struct restore_tail_stats tail_stats = {};
+	u64 step_start_us;
 
 	ret = run_scripts(ACT_PRE_RESTORE);
 	if (ret != 0) {
@@ -2218,31 +2257,41 @@ skip_ns_bouncing:
 	 */
 	attach_to_tasks(root_seized);
 
+	step_start_us = restore_tail_now_us();
 	if (restore_switch_stage(CR_STATE_RESTORE_CREDS))
 		goto out_kill_network_unlocked;
+	tail_stats.wait_creds_barrier_us = restore_tail_now_us() - step_start_us;
 
 	timing_stop(TIME_RESTORE);
 
-	if (catch_tasks(root_seized)) {
+	step_start_us = restore_tail_now_us();
+	if (catch_tasks(root_seized, &tail_stats.catch_tasks)) {
 		pr_err("Can't catch all tasks\n");
 		goto out_kill_network_unlocked;
 	}
+	tail_stats.catch_tasks_us = restore_tail_now_us() - step_start_us;
 
 	if (lazy_pages_finish_restore())
 		goto out_kill_network_unlocked;
 
 	__restore_switch_stage(CR_STATE_COMPLETE);
 
+	step_start_us = restore_tail_now_us();
 	ret = compel_stop_on_syscall(task_entries->nr_threads, __NR(rt_sigreturn, 0), __NR(rt_sigreturn, 1));
+	tail_stats.stop_on_syscall_us = restore_tail_now_us() - step_start_us;
 	if (ret) {
 		pr_err("Can't stop all tasks on rt_sigreturn\n");
 		goto out_kill_network_unlocked;
 	}
+	step_start_us = restore_tail_now_us();
 	finalize_restore();
+	tail_stats.finalize_restore_us = restore_tail_now_us() - step_start_us;
 
 	/* just before releasing threads we have to restore rseq_cs */
+	step_start_us = restore_tail_now_us();
 	if (restore_rseq_cs())
 		pr_err("Unable to restore rseq_cs state\n");
+	tail_stats.restore_rseq_cs_us = restore_tail_now_us() - step_start_us;
 
 	/*
 	 * Some external devices such as GPUs might need a very late
@@ -2253,6 +2302,7 @@ skip_ns_bouncing:
 	 * mapped memory) could be done sanely once the pie code hands
 	 * over the control to master process.
 	 */
+	step_start_us = restore_tail_now_us();
 	pr_info("Run late stage hook from criu master for external devices\n");
 	for_each_pstree_item(item) {
 		if (!task_alive(item))
@@ -2269,17 +2319,38 @@ skip_ns_bouncing:
 		if (ret < 0 && ret != -ENOTSUP)
 			pr_debug("restore late stage hook for external plugin failed\n");
 	}
+	tail_stats.late_hook_us = restore_tail_now_us() - step_start_us;
 
+	step_start_us = restore_tail_now_us();
 	ret = run_scripts(ACT_PRE_RESUME);
+	tail_stats.pre_resume_us = restore_tail_now_us() - step_start_us;
 	if (ret)
 		pr_err("Pre-resume script ret code %d\n", ret);
 
+	step_start_us = restore_tail_now_us();
 	if (restore_freezer_state())
 		pr_err("Unable to restore freezer state\n");
+	tail_stats.restore_freezer_us = restore_tail_now_us() - step_start_us;
 
 	/* Detaches from processes and they continue run through sigreturn. */
+	step_start_us = restore_tail_now_us();
 	if (finalize_restore_detach())
 		goto out_kill_network_unlocked;
+	tail_stats.finalize_detach_us = restore_tail_now_us() - step_start_us;
+
+	pr_info("Restore master tail summary wait-creds=%llu ms catch=%llu ms stop-on-syscall=%llu ms finalize=%llu ms rseq=%llu ms late-hook=%llu ms pre-resume=%llu ms freezer=%llu ms detach=%llu ms catch-threads=%llu catch-interrupt-wait=%llu ms catch-stop-pie=%llu ms\n",
+		(unsigned long long)(tail_stats.wait_creds_barrier_us / 1000ULL),
+		(unsigned long long)(tail_stats.catch_tasks_us / 1000ULL),
+		(unsigned long long)(tail_stats.stop_on_syscall_us / 1000ULL),
+		(unsigned long long)(tail_stats.finalize_restore_us / 1000ULL),
+		(unsigned long long)(tail_stats.restore_rseq_cs_us / 1000ULL),
+		(unsigned long long)(tail_stats.late_hook_us / 1000ULL),
+		(unsigned long long)(tail_stats.pre_resume_us / 1000ULL),
+		(unsigned long long)(tail_stats.restore_freezer_us / 1000ULL),
+		(unsigned long long)(tail_stats.finalize_detach_us / 1000ULL),
+		(unsigned long long)tail_stats.catch_tasks.threads,
+		(unsigned long long)(tail_stats.catch_tasks.interrupt_wait_us / 1000ULL),
+		(unsigned long long)(tail_stats.catch_tasks.stop_pie_us / 1000ULL));
 
 	pr_info("Restore finished successfully. Tasks resumed.\n");
 	write_stats(RESTORE_STATS);

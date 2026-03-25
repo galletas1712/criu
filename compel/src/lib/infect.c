@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <stdio.h>
 #include <fcntl.h>
 #include <linux/seccomp.h>
@@ -1649,6 +1650,30 @@ static inline int is_required_syscall(user_regs_struct_t *regs, pid_t pid, const
 	return (REG_SYSCALL_NR(*regs) == req_sysnr);
 }
 
+static inline uint64_t stop_on_syscall_now_us(void)
+{
+	struct timeval tv;
+
+	gettimeofday(&tv, NULL);
+	return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+}
+
+struct stop_on_syscall_stats {
+	uint64_t total_us;
+	uint64_t wait_any_us;
+	uint64_t wait_target_us;
+	uint64_t get_regs_us;
+	uint64_t ptrace_restart_us;
+	uint64_t flush_breakpoint_us;
+	unsigned int requested_tasks;
+	unsigned int trapped_stops;
+	unsigned int syscall_stops;
+	unsigned int required_syscalls;
+	unsigned int mismatched_syscalls;
+	unsigned int breakpoint_stops;
+	unsigned int completed_tasks;
+};
+
 /*
  * Trap tasks on the exit from the specified syscall
  *
@@ -1658,22 +1683,34 @@ static inline int is_required_syscall(user_regs_struct_t *regs, pid_t pid, const
  */
 int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
 {
+	struct stop_on_syscall_stats stats = {
+		.requested_tasks = tasks,
+	};
 	enum trace_flags trace = tasks > 1 ? TRACE_ALL : TRACE_ENTER;
 	user_regs_struct_t regs;
-	int status, ret;
+	int status, ret = 0;
 	pid_t pid;
+	uint64_t start_us = stop_on_syscall_now_us();
 
 	/* Stop all threads on the enter point in sys_rt_sigreturn */
 	while (tasks) {
+		uint64_t step_start_us = stop_on_syscall_now_us();
+
 		pid = wait4(-1, &status, __WALL, NULL);
 		if (pid == -1) {
 			pr_perror("wait4 failed");
-			return -1;
+			ret = -1;
+			goto out;
 		}
+		stats.wait_any_us += stop_on_syscall_now_us() - step_start_us;
 
 		if (!task_is_trapped(status, pid))
-			return -1;
+		{
+			ret = -1;
+			goto out;
+		}
 
+		stats.trapped_stops++;
 		pr_debug("%d was trapped\n", pid);
 
 		if ((WSTOPSIG(status) & PTRACE_SYSCALL_TRAP) == 0) {
@@ -1682,12 +1719,17 @@ int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
 			 * pass through a breakpoint, so let's clear it right
 			 * after it has been triggered.
 			*/
+			step_start_us = stop_on_syscall_now_us();
 			if (ptrace_flush_breakpoints(pid)) {
 				pr_err("Unable to clear breakpoints\n");
-				return -1;
+				ret = -1;
+				goto out;
 			}
+			stats.flush_breakpoint_us += stop_on_syscall_now_us() - step_start_us;
+			stats.breakpoint_stops++;
 			goto goon;
 		}
+		stats.syscall_stops++;
 		if (trace == TRACE_EXIT) {
 			trace = TRACE_ENTER;
 			pr_debug("`- Expecting exit\n");
@@ -1696,10 +1738,13 @@ int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
 		if (trace == TRACE_ENTER)
 			trace = TRACE_EXIT;
 
+		step_start_us = stop_on_syscall_now_us();
 		ret = ptrace_get_regs(pid, &regs);
+		stats.get_regs_us += stop_on_syscall_now_us() - step_start_us;
 		if (ret) {
 			pr_perror("ptrace");
-			return -1;
+			ret = -1;
+			goto out;
 		}
 
 		if (is_required_syscall(&regs, pid, sys_nr, sys_nr_compat)) {
@@ -1707,34 +1752,59 @@ int compel_stop_on_syscall(int tasks, const int sys_nr, const int sys_nr_compat)
 			 * The process is going to execute the required syscall,
 			 * the next stop will be on the exit from this syscall
 			 */
+			stats.required_syscalls++;
+			step_start_us = stop_on_syscall_now_us();
 			ret = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
+			stats.ptrace_restart_us += stop_on_syscall_now_us() - step_start_us;
 			if (ret) {
 				pr_perror("ptrace");
-				return -1;
+				ret = -1;
+				goto out;
 			}
 
+			step_start_us = stop_on_syscall_now_us();
 			pid = wait4(pid, &status, __WALL, NULL);
+			stats.wait_target_us += stop_on_syscall_now_us() - step_start_us;
 			if (pid == -1) {
 				pr_perror("wait4 failed");
-				return -1;
+				ret = -1;
+				goto out;
 			}
 
 			if (!task_is_trapped(status, pid))
-				return -1;
+			{
+				ret = -1;
+				goto out;
+			}
 
 			pr_debug("%d was stopped\n", pid);
+			stats.completed_tasks++;
 			tasks--;
 			continue;
 		}
+		stats.mismatched_syscalls++;
 	goon:
+		step_start_us = stop_on_syscall_now_us();
 		ret = ptrace(PTRACE_SYSCALL, pid, NULL, NULL);
+		stats.ptrace_restart_us += stop_on_syscall_now_us() - step_start_us;
 		if (ret) {
 			pr_perror("ptrace");
-			return -1;
+			ret = -1;
+			goto out;
 		}
 	}
 
-	return 0;
+out:
+	stats.total_us = stop_on_syscall_now_us() - start_us;
+	pr_info("Stop-on-syscall summary tasks=%u completed=%u trapped=%u syscall-stops=%u required=%u mismatched=%u breakpoint=%u wait-any=%llu ms wait-target=%llu ms get-regs=%llu ms restart=%llu ms flush-bp=%llu ms wall=%llu ms result=%d\n",
+		stats.requested_tasks, stats.completed_tasks, stats.trapped_stops, stats.syscall_stops, stats.required_syscalls,
+		stats.mismatched_syscalls, stats.breakpoint_stops, (unsigned long long)(stats.wait_any_us / 1000ULL),
+		(unsigned long long)(stats.wait_target_us / 1000ULL),
+		(unsigned long long)(stats.get_regs_us / 1000ULL),
+		(unsigned long long)(stats.ptrace_restart_us / 1000ULL),
+		(unsigned long long)(stats.flush_breakpoint_us / 1000ULL),
+		(unsigned long long)(stats.total_us / 1000ULL), ret);
+	return ret;
 }
 
 int compel_mode_native(struct parasite_ctl *ctl)

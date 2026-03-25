@@ -20,6 +20,8 @@
 #include "img-streamer.h"
 #include "namespaces.h"
 
+#define COMPACT_PAGES_COMMIT_FILE "pages-dedup.ready"
+
 bool ns_per_id = false;
 bool img_common_magic = true;
 TaskKobjIdsEntry *root_ids;
@@ -830,29 +832,101 @@ static bool raw_pages_exist(int dfd, u32 pages_id)
 	return exists;
 }
 
-struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
+static bool pages_blob_exists(int dfd)
+{
+	bool exists;
+	struct cr_img *blob = open_image_at(dfd, CR_FD_PAGES_BLOB, O_RSTR);
+
+	if (!blob)
+		return false;
+
+	exists = !empty_image(blob);
+	close_image(blob);
+	return exists;
+}
+
+bool compact_pages_committed(int dfd, u32 pages_id)
+{
+	struct stat st;
+
+	if (fstatat(dfd, COMPACT_PAGES_COMMIT_FILE, &st, 0)) {
+		if (errno != ENOENT)
+			pr_perror("Can't stat compact pages commit marker");
+		return false;
+	}
+
+	return page_index_exists(dfd, pages_id) && pages_blob_exists(dfd);
+}
+
+int clear_compact_pages_commit(int dfd)
+{
+	if (!unlinkat(dfd, COMPACT_PAGES_COMMIT_FILE, 0))
+		return 0;
+	if (errno == ENOENT)
+		return 0;
+
+	pr_perror("Can't remove compact pages commit marker");
+	return -1;
+}
+
+int mark_compact_pages_commit(int dfd)
+{
+	int fd = openat(dfd, COMPACT_PAGES_COMMIT_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+	if (fd < 0) {
+		pr_perror("Can't create compact pages commit marker");
+		return -1;
+	}
+
+	if (write(fd, "1\n", 2) != 2) {
+		pr_perror("Can't write compact pages commit marker");
+		close(fd);
+		return -1;
+	}
+
+	if (close(fd)) {
+		pr_perror("Can't close compact pages commit marker");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int open_pages_image_id(unsigned long flags, struct cr_img *pmi, u32 *id)
 {
 	if (flags == O_RDONLY || flags == O_RDWR) {
 		PagemapHead *h;
+
 		if (pb_read_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
-			return NULL;
+			return -1;
 		*id = h->pages_id;
 		pagemap_head__free_unpacked(h, NULL);
-
-		/*
-		 * A compact image is committed only once the raw pages-%u.img has
-		 * been removed. If the raw file is still present, prefer it so
-		 * stale or partial page-index sidecars never flip restore into
-		 * compact mode.
-		 */
-		if (page_index_exists(dfd, *id) && !raw_pages_exist(dfd, *id))
-			return open_image_at(dfd, CR_FD_PAGES_BLOB, O_RSTR);
 	} else {
 		PagemapHead h = PAGEMAP_HEAD__INIT;
+
 		*id = h.pages_id = page_ids++;
 		if (pb_write_one(pmi, &h, PB_PAGEMAP_HEAD) < 0)
-			return NULL;
+			return -1;
 	}
+
+	return 0;
+}
+
+struct cr_img *open_raw_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
+{
+	if (open_pages_image_id(flags, pmi, id))
+		return NULL;
+
+	return open_image_at(dfd, CR_FD_PAGES, flags, *id);
+}
+
+struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
+{
+	if (open_pages_image_id(flags, pmi, id))
+		return NULL;
+
+	if ((flags == O_RDONLY || flags == O_RDWR) && compact_pages_committed(dfd, *id) && !raw_pages_exist(dfd, *id))
+		return open_image_at(dfd, CR_FD_PAGES_BLOB, O_RSTR);
 
 	return open_image_at(dfd, CR_FD_PAGES, flags, *id);
 }

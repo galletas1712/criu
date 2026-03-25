@@ -1030,6 +1030,7 @@ static int read_indexed_pages(struct page_read *pr, off_t logical_off, unsigned 
 			struct iovec *run_iov = run_iov_stack;
 			struct iovec *bounce_iov = NULL;
 			struct iovec *read_iov;
+			void *fallback_buf = NULL;
 			unsigned int run_iov_n = run_pages - chunk_start;
 			unsigned int j;
 			ssize_t read_ret;
@@ -1099,6 +1100,25 @@ static int read_indexed_pages(struct page_read *pr, off_t logical_off, unsigned 
 
 			read_ret = preadv(fd, read_iov, run_iov_n, chunk_off);
 			if (read_ret < 0 || (unsigned long)read_ret != run_iov_n * PAGE_SIZE) {
+				if (read_ret < 0 && errno == EINVAL) {
+					int err = posix_memalign(&fallback_buf, PAGE_SIZE, (size_t)run_iov_n * PAGE_SIZE);
+
+					if (!err && !pread_full(fd, fallback_buf, (size_t)run_iov_n * PAGE_SIZE, chunk_off, NULL)) {
+						pr_info("compact page replay fallback for %u pages at off %llu after preadv EINVAL\n",
+							run_iov_n, (unsigned long long)chunk_off);
+						for (j = 0; j < run_iov_n; j++)
+							memcpy(run_iov[j].iov_base, (char *)fallback_buf + j * PAGE_SIZE, PAGE_SIZE);
+						xfree(fallback_buf);
+						if (bounce_iov && bounce_iov != bounce_iov_stack)
+							xfree(bounce_iov);
+						xfree(aligned_buf);
+						if (run_iov != run_iov_stack)
+							xfree(run_iov);
+						continue;
+					}
+
+					xfree(fallback_buf);
+				}
 				if (read_ret < 0)
 					pr_perror("Can't read compacted page run");
 				else

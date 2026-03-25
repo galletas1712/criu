@@ -804,6 +804,19 @@ void up_page_ids_base(void)
 	page_ids += 0x10000;
 }
 
+static bool page_index_exists(int dfd, u32 pages_id)
+{
+	bool exists;
+	struct cr_img *index = open_image_at(dfd, CR_FD_PAGE_INDEX, O_RSTR, pages_id);
+
+	if (!index)
+		return false;
+
+	exists = !empty_image(index);
+	close_image(index);
+	return exists;
+}
+
 struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
 {
 	if (flags == O_RDONLY || flags == O_RDWR) {
@@ -812,6 +825,9 @@ struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *
 			return NULL;
 		*id = h->pages_id;
 		pagemap_head__free_unpacked(h, NULL);
+
+		if (page_index_exists(dfd, *id))
+			return open_image_at(dfd, CR_FD_PAGES_BLOB, O_RSTR);
 	} else {
 		PagemapHead h = PAGEMAP_HEAD__INIT;
 		*id = h.pages_id = page_ids++;

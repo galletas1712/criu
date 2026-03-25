@@ -33,6 +33,8 @@
 #define COALESCE_MAX_THREADS 32
 #define COALESCE_INITIAL_SLOTS (1 << 22)
 
+static const unsigned char zero_page[PAGE_SIZE] __attribute__((aligned(64)));
+
 struct page_hash_key {
 	u64 w0;
 	u64 w1;
@@ -196,23 +198,32 @@ static inline u64 page_hash_step(u64 state, u64 word, u64 addend, u64 multiplier
 	return state;
 }
 
+static bool page_is_all_zero(const void *page)
+{
+	return memcmp(page, zero_page, PAGE_SIZE) == 0;
+}
+
 static void compute_page_hash_key(const void *page, struct page_hash_key *out, bool *zero)
 {
 	const u64 *words = page;
 	const u64 *end = words + PAGE_SIZE / sizeof(*words);
 	u64 h0 = 0x243f6a8885a308d3ULL;
 	u64 h1 = 0x13198a2e03707344ULL;
-	u64 zero_bits = 0;
+
+	if (page_is_all_zero(page)) {
+		*zero = true;
+		memzero(out, sizeof(*out));
+		return;
+	}
 
 	while (words < end) {
 		u64 word = *words++;
 
-		zero_bits |= word;
 		h0 = page_hash_step(h0, word, 0x9e3779b97f4a7c15ULL, 0xc2b2ae3d27d4eb4fULL);
 		h1 = page_hash_step(h1, rotl64(word, 17), 0x94d049bb133111ebULL, 0x165667b19e3779f9ULL);
 	}
 
-	*zero = zero_bits == 0;
+	*zero = false;
 	h0 = fmix64(h0 ^ PAGE_SIZE);
 	h1 = fmix64(h1 ^ (PAGE_SIZE << 1));
 	out->w0 = h0;

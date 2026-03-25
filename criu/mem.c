@@ -854,6 +854,11 @@ static inline bool vma_inherited(struct vma_area *vma)
 	return (vma->pvma != NULL && vma->pvma != VMA_COW_ROOT);
 }
 
+static inline bool vma_zero_skip_restore(struct vma_area *vma)
+{
+	return vma_area_is(vma, VMA_ANON_PRIVATE) && !vma_inherited(vma);
+}
+
 static void prepare_cow_vmas_for(struct vm_area_list *vmas, struct vm_area_list *pvmas)
 {
 	struct vma_area *vma, *pvma;
@@ -1209,10 +1214,12 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 					BUG();
 				}
 
+				pr->zero_skip = vma_zero_skip_restore(vma);
 				if (pagemap_enqueue_iovec(pr, (void *)va, len, vma_io))
 					return -1;
 
 				pr->skip_pages(pr, len);
+				pr->zero_skip = false;
 
 				va += len;
 				len >>= PAGE_SHIFT;
@@ -1276,7 +1283,9 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 
 				nr = min_t(int, nr_pages - i, (vma->e->end - va) / PAGE_SIZE);
 
+				pr->zero_skip = vma_zero_skip_restore(vma);
 				ret = pr->read_pages(pr, va, nr, p, PR_ASYNC);
+				pr->zero_skip = false;
 				if (ret < 0)
 					goto err_read;
 

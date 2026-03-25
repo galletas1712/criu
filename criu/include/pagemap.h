@@ -65,6 +65,7 @@ struct page_read {
 	 * open_page_read_fd_at() after the NFS probe; never changes after
 	 * that. Cached here to avoid a fcntl(F_GETFL) syscall per page read. */
 	bool use_direct;
+	bool zero_skip;
 
 	/* Private data of reader */
 	struct cr_img *pmi;

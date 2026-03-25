@@ -61,6 +61,154 @@ static inline bool compact_io_is_zero_skip(off_t off);
 static inline bool compact_io_is_run(off_t off);
 static inline off_t compact_io_decode(off_t off);
 
+static bool direct_io_aligned(const void *buf, size_t len, off_t off)
+{
+	return (((unsigned long)buf & (PAGE_SIZE - 1)) == 0) && ((len & (PAGE_SIZE - 1)) == 0) &&
+	       ((off & (PAGE_SIZE - 1)) == 0);
+}
+
+static bool direct_iovs_aligned(const struct iovec *iov, unsigned int nr, off_t off)
+{
+	unsigned int i;
+
+	if (off & (PAGE_SIZE - 1))
+		return false;
+
+	for (i = 0; i < nr; i++) {
+		if (!direct_io_aligned(iov[i].iov_base, iov[i].iov_len, off))
+			return false;
+	}
+
+	return true;
+}
+
+static int pread_full(int fd, void *buf, size_t len, off_t off, unsigned int *short_reads)
+{
+	size_t curr = 0;
+
+	while (curr < len) {
+		ssize_t ret = pread(fd, (char *)buf + curr, len - curr, off + curr);
+
+		if (ret < 1) {
+			if (ret < 0)
+				pr_perror("Can't read mapping page %zd", ret);
+			else
+				pr_err("Unexpected EOF while reading %zu bytes at off %lld\n", len - curr,
+				       (long long)(off + curr));
+			return -1;
+		}
+
+		curr += ret;
+		if (curr < len && short_reads)
+			(*short_reads)++;
+	}
+
+	return 0;
+}
+
+static int copy_linear_to_iovecs(const void *src, const struct iovec *iov, unsigned int nr)
+{
+	const char *curr = src;
+	unsigned int i;
+
+	for (i = 0; i < nr; i++) {
+		memcpy(iov[i].iov_base, curr, iov[i].iov_len);
+		curr += iov[i].iov_len;
+	}
+
+	return 0;
+}
+
+static void advance_iovecs(struct iovec **iov, unsigned int *nr, ssize_t len)
+{
+	while (len > 0) {
+		if (len >= (ssize_t)(*iov)->iov_len) {
+			len -= (*iov)->iov_len;
+			(*iov)++;
+			(*nr)--;
+			continue;
+		}
+
+		(*iov)->iov_base += len;
+		(*iov)->iov_len -= len;
+		break;
+	}
+}
+
+static int direct_read_iovecs(struct page_read *pr, int fd, off_t off, struct iovec *iov, unsigned int nr,
+			      size_t len, unsigned int *short_reads)
+{
+	void *aligned_buf = NULL;
+	struct iovec *direct_iov = NULL;
+	struct iovec *direct_curr;
+	unsigned int direct_nr;
+	int ret;
+	bool aligned = direct_iovs_aligned(iov, nr, off);
+
+	pr->direct_pages += len / PAGE_SIZE;
+	if (!aligned) {
+		int err;
+
+		pr->direct_misaligned_pages += len / PAGE_SIZE;
+		pr->direct_misaligned_reads++;
+
+		err = posix_memalign(&aligned_buf, PAGE_SIZE, len);
+		if (err) {
+			pr_err("Can't allocate aligned buffer for direct read (%zu bytes, err=%d)\n", len, err);
+			return -1;
+		}
+
+		ret = pread_full(fd, aligned_buf, len, off, short_reads);
+		if (!ret)
+			ret = copy_linear_to_iovecs(aligned_buf, iov, nr);
+		xfree(aligned_buf);
+		return ret;
+	}
+
+	direct_iov = xmalloc(nr * sizeof(*direct_iov));
+	if (!direct_iov) {
+		pr_err("Can't allocate direct iovec scratch (%u entries)\n", nr);
+		return -1;
+	}
+
+	memcpy(direct_iov, iov, nr * sizeof(*direct_iov));
+	direct_curr = direct_iov;
+	direct_nr = nr;
+	while (1) {
+		ssize_t bytes = preadv(fd, direct_curr, direct_nr, off);
+
+		if (fault_injected(FI_PARTIAL_PAGES)) {
+			if (bytes > 0 && direct_nr >= 2) {
+				pr_debug("`- trim preadv %zu\n", bytes);
+				bytes /= 2;
+			}
+		}
+
+		if (bytes < 0) {
+			pr_err("Can't read async pr bytes (%zd / %zu read, %lld off, %u iovs)\n", bytes, len,
+			       (long long)off, direct_nr);
+			xfree(direct_iov);
+			return -1;
+		}
+		if (bytes == 0) {
+			pr_err("Unexpected EOF in async page read (%zu bytes remaining at off %lld, %u iovs)\n", len,
+			       (long long)off, direct_nr);
+			xfree(direct_iov);
+			return -1;
+		}
+		if ((size_t)bytes == len) {
+			xfree(direct_iov);
+			return 0;
+		}
+
+		if (short_reads)
+			(*short_reads)++;
+		advance_iovecs(&direct_curr, &direct_nr, bytes);
+		off += bytes;
+		len -= bytes;
+	}
+}
+
 static int compact_page_ref_cmp(const void *a, const void *b)
 {
 	const struct compact_page_ref *ra = a;
@@ -564,11 +712,15 @@ static int read_indexed_pages(struct page_read *pr, off_t logical_off, unsigned 
 
 		for (unsigned long chunk_start = 0; chunk_start < run_pages; chunk_start += (unsigned long)IOV_MAX) {
 			struct iovec run_iov_stack[64];
+			struct iovec bounce_iov_stack[64];
 			struct iovec *run_iov = run_iov_stack;
+			struct iovec *bounce_iov = NULL;
+			struct iovec *read_iov = run_iov;
 			unsigned int run_iov_n = run_pages - chunk_start;
 			unsigned int j;
 			ssize_t read_ret;
 			unsigned long chunk_off = (off_t)groups[run_start + chunk_start].off;
+			void *aligned_buf = NULL;
 
 			if (run_iov_n > IOV_MAX)
 				run_iov_n = IOV_MAX;
@@ -585,19 +737,75 @@ static int read_indexed_pages(struct page_read *pr, off_t logical_off, unsigned 
 				run_iov[j].iov_len = PAGE_SIZE;
 			}
 
-			read_ret = preadv(fd, run_iov, run_iov_n, chunk_off);
+			if (pr->use_direct) {
+				bool aligned = (chunk_off & (PAGE_SIZE - 1)) == 0;
+
+				pr->direct_pages += run_iov_n;
+				for (j = 0; aligned && j < run_iov_n; j++) {
+					if (((unsigned long)run_iov[j].iov_base & (PAGE_SIZE - 1)) ||
+					    (run_iov[j].iov_len & (PAGE_SIZE - 1)))
+						aligned = false;
+				}
+
+				if (!aligned) {
+					int err;
+
+					pr->direct_misaligned_pages += run_iov_n;
+					pr->direct_misaligned_reads++;
+					err = posix_memalign(&aligned_buf, PAGE_SIZE, (size_t)run_iov_n * PAGE_SIZE);
+					if (err) {
+						pr_err("Can't allocate aligned compact read buffer (%u pages, err=%d)\n",
+						       run_iov_n, err);
+						if (run_iov != run_iov_stack)
+							xfree(run_iov);
+						ret = -1;
+						goto out;
+					}
+
+					bounce_iov = bounce_iov_stack;
+					if (run_iov_n > ARRAY_SIZE(bounce_iov_stack)) {
+						bounce_iov = xmalloc(run_iov_n * sizeof(*bounce_iov));
+						if (!bounce_iov) {
+							xfree(aligned_buf);
+							if (run_iov != run_iov_stack)
+								xfree(run_iov);
+							ret = -1;
+							goto out;
+						}
+					}
+
+					for (j = 0; j < run_iov_n; j++) {
+						bounce_iov[j].iov_base = (char *)aligned_buf + j * PAGE_SIZE;
+						bounce_iov[j].iov_len = PAGE_SIZE;
+					}
+					read_iov = bounce_iov;
+				}
+			}
+
+			read_ret = preadv(fd, read_iov, run_iov_n, chunk_off);
 			if (read_ret < 0 || (unsigned long)read_ret != run_iov_n * PAGE_SIZE) {
 				if (read_ret < 0)
 					pr_perror("Can't read compacted page run");
 				else
 					pr_err("Short read from compacted page run: %zd/%u pages at off %llu\n",
 					       read_ret, run_iov_n, (unsigned long long)chunk_off);
+				if (bounce_iov && bounce_iov != bounce_iov_stack)
+					xfree(bounce_iov);
+				xfree(aligned_buf);
 				if (run_iov != run_iov_stack)
 					xfree(run_iov);
 				ret = -1;
 				goto out;
 			}
 
+			if (aligned_buf) {
+				for (j = 0; j < run_iov_n; j++)
+					memcpy(run_iov[j].iov_base, bounce_iov[j].iov_base, PAGE_SIZE);
+			}
+
+			if (bounce_iov && bounce_iov != bounce_iov_stack)
+				xfree(bounce_iov);
+			xfree(aligned_buf);
 			if (run_iov != run_iov_stack)
 				xfree(run_iov);
 		}
@@ -1729,6 +1937,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->pieok = false;
 	pr->disable_dedup = false;
 	pr->zero_skip = false;
+	pr->use_direct = false;
 	pr->direct_pages = 0;
 	pr->direct_misaligned_pages = 0;
 	pr->direct_misaligned_reads = 0;
@@ -1747,7 +1956,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		return -1;
 	}
 
-	pr->pi = open_pages_image_at(dfd, flags, pr->pmi, &pr->pages_img_id);
+	pr->pi = open_pages_image_at(dfd, flags | O_TRY_DIRECT_OPEN, pr->pmi, &pr->pages_img_id);
 	if (!pr->pi || empty_image(pr->pi)) {
 		close_page_read(pr);
 		return -1;
@@ -1765,10 +1974,19 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		}
 	}
 
-	if (!pr->pidx) {
+	{
 		int pfd = img_raw_fd(pr->pi);
-		if (pfd >= 0)
-			posix_fadvise(pfd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+		if (pfd >= 0) {
+			int fl = fcntl(pfd, F_GETFL);
+
+			if (fl >= 0 && (fl & O_DIRECT)) {
+				pr_debug("O_DIRECT enabled on pages fd %d at open time\n", pfd);
+				pr->use_direct = true;
+			} else if (!pr->pidx) {
+				posix_fadvise(pfd, 0, 0, POSIX_FADV_SEQUENTIAL);
+			}
+		}
 	}
 
 	if (pr->pidx) {

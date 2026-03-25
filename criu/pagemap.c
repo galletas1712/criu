@@ -152,6 +152,90 @@ static int append_compact_page_read_iov(struct list_head *to, struct page_read_i
 	return append_page_read_iov(dst, src);
 }
 
+static int compact_async_piov_cmp(const void *a, const void *b)
+{
+	const struct page_read_iov *const *pa = a;
+	const struct page_read_iov *const *pb = b;
+	bool a_zero = compact_io_is_zero((*pa)->from);
+	bool b_zero = compact_io_is_zero((*pb)->from);
+	unsigned long a_dst = (unsigned long)(*pa)->to[0].iov_base;
+	unsigned long b_dst = (unsigned long)(*pb)->to[0].iov_base;
+
+	if (a_zero != b_zero)
+		return a_zero ? 1 : -1;
+	if (!a_zero) {
+		off_t a_from = compact_io_decode((*pa)->from);
+		off_t b_from = compact_io_decode((*pb)->from);
+
+		if (a_from < b_from)
+			return -1;
+		if (a_from > b_from)
+			return 1;
+	}
+	if (a_dst < b_dst)
+		return -1;
+	if (a_dst > b_dst)
+		return 1;
+	return 0;
+}
+
+static void prepare_compact_async_queue(struct page_read *pr, u64 *sort_us, u64 *merge_us,
+					unsigned int *queue_jobs, unsigned int *merged_jobs)
+{
+	struct timeval tv0, tv1, tv2, tv3;
+	struct page_read_iov **piovs;
+	struct page_read_iov *piov;
+	struct list_head sorted;
+	unsigned int nr = 0;
+	unsigned int i = 0;
+
+	if (!pr->pidx)
+		return;
+
+	list_for_each_entry(piov, &pr->async, l)
+		nr++;
+	*queue_jobs = nr;
+	*merged_jobs = nr;
+	if (nr < 2)
+		return;
+
+	piovs = xmalloc(nr * sizeof(*piovs));
+	if (!piovs) {
+		pr_warn("Can't allocate compact async sort array, keeping logical order\n");
+		return;
+	}
+
+	list_for_each_entry(piov, &pr->async, l)
+		piovs[i++] = piov;
+
+	gettimeofday(&tv0, NULL);
+	qsort(piovs, nr, sizeof(*piovs), compact_async_piov_cmp);
+	gettimeofday(&tv1, NULL);
+
+	INIT_LIST_HEAD(&sorted);
+	gettimeofday(&tv2, NULL);
+	for (i = 0; i < nr; i++) {
+		list_del_init(&piovs[i]->l);
+		if (append_compact_page_read_iov(&sorted, piovs[i])) {
+			pr_warn("Can't merge compact async queue entry, keeping split job\n");
+			list_add_tail(&piovs[i]->l, &sorted);
+		}
+	}
+	list_splice_init(&sorted, &pr->async);
+	*sort_us = (u64)(tv1.tv_sec - tv0.tv_sec) * 1000000ULL +
+		   (u64)(tv1.tv_usec - tv0.tv_usec);
+	gettimeofday(&tv3, NULL);
+	*merge_us = (u64)(tv3.tv_sec - tv2.tv_sec) * 1000000ULL +
+		    (u64)(tv3.tv_usec - tv2.tv_usec);
+
+	nr = 0;
+	list_for_each_entry(piov, &pr->async, l)
+		nr++;
+	*merged_jobs = nr;
+
+	xfree(piovs);
+}
+
 static inline bool can_extend_bunch(struct iovec *bunch, unsigned long off, unsigned long len)
 {
 	return /* The next region is the continuation of the existing */
@@ -1247,9 +1331,14 @@ static int process_async_reads(struct page_read *pr)
 	unsigned int short_reads = 0;
 	unsigned int max_iovs = 0;
 	unsigned int max_copies = 0;
+	unsigned int queue_jobs = 0;
+	unsigned int merged_jobs = 0;
 	u64 copy_us = 0;
+	u64 sort_us = 0;
+	u64 merge_us = 0;
 
 	fd = img_raw_fd(pr->pi);
+	prepare_compact_async_queue(pr, &sort_us, &merge_us, &queue_jobs, &merged_jobs);
 	/* Pre-warm page cache for all async read ranges (fadvise + preadv strategy) */
 	gettimeofday(&tv0, NULL);
 	list_for_each_entry(piov, &pr->async, l) {
@@ -1377,14 +1466,16 @@ static int process_async_reads(struct page_read *pr)
 	if (have_range && last_end > first_off) {
 		unsigned long fadv_ms = (unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000);
 		unsigned long preadv_ms = (unsigned long)((tv2.tv_sec - tv1.tv_sec) * 1000 + (tv2.tv_usec - tv1.tv_usec) / 1000);
-		pr_info("pagemap async fadvise %lu ms preadv %lu ms zero-fill %zu MiB (%u ios) copy %lu ms (%zu MiB, %u ios) read %zu MiB (%u ios, %u short, max %u iovs, max %u copies) (range %zu MiB)\n",
+		pr_info("pagemap async sort %lu ms merge %lu ms jobs %u->%u fadvise %lu ms preadv %lu ms zero-fill %zu MiB (%u ios) copy %lu ms (%zu MiB, %u ios) read %zu MiB (%u ios, %u short, max %u iovs, max %u copies) (range %zu MiB)\n",
+			(unsigned long)(sort_us / 1000ULL), (unsigned long)(merge_us / 1000ULL), queue_jobs, merged_jobs,
 			fadv_ms, preadv_ms, zero_bytes / (1024 * 1024), zero_ios,
 			(unsigned long)(copy_us / 1000ULL), copy_bytes / (1024 * 1024), copy_ios,
 			read_bytes / (1024 * 1024), read_ios, short_reads, max_iovs, max_copies,
 			(size_t)((last_end - first_off) / (1024 * 1024)));
 	} else if (zero_bytes > 0 || copy_bytes > 0) {
 		unsigned long zero_ms = (unsigned long)((tv2.tv_sec - tv1.tv_sec) * 1000 + (tv2.tv_usec - tv1.tv_usec) / 1000);
-		pr_info("pagemap async zero-fill %lu ms (%zu MiB, %u ios) copy %lu ms (%zu MiB, %u ios) read %zu MiB (%u ios, %u short, max %u iovs, max %u copies)\n",
+		pr_info("pagemap async sort %lu ms merge %lu ms jobs %u->%u zero-fill %lu ms (%zu MiB, %u ios) copy %lu ms (%zu MiB, %u ios) read %zu MiB (%u ios, %u short, max %u iovs, max %u copies)\n",
+			(unsigned long)(sort_us / 1000ULL), (unsigned long)(merge_us / 1000ULL), queue_jobs, merged_jobs,
 			zero_ms, zero_bytes / (1024 * 1024), zero_ios,
 			(unsigned long)(copy_us / 1000ULL), copy_bytes / (1024 * 1024), copy_ios,
 			read_bytes / (1024 * 1024), read_ios, short_reads, max_iovs, max_copies);

@@ -763,7 +763,13 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	struct task_restore_args *ta;
 	u64 total_start_us = restore_tail_now_us();
 	u64 files_us = 0;
+	u64 prepare_fds_us = 0;
+	u64 file_locks_us = 0;
 	u64 vma_open_us = 0;
+	u64 open_vmas_us = 0;
+	u64 prepare_aios_us = 0;
+	u64 fixup_sysv_shmems_us = 0;
+	u64 open_cores_us = 0;
 	u64 task_state_us = 0;
 	u64 mm_vmas_us = 0;
 	u64 net_uffd_us = 0;
@@ -782,24 +788,34 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	step_start_us = restore_tail_now_us();
 	if (prepare_fds(current))
 		return -1;
+	prepare_fds_us = restore_tail_now_us() - step_start_us;
 
+	step_start_us = restore_tail_now_us();
 	if (prepare_file_locks(pid))
 		return -1;
-	files_us = restore_tail_now_us() - step_start_us;
+	file_locks_us = restore_tail_now_us() - step_start_us;
+	files_us = prepare_fds_us + file_locks_us;
 
 	step_start_us = restore_tail_now_us();
 	if (open_vmas(current))
 		return -1;
+	open_vmas_us = restore_tail_now_us() - step_start_us;
 
+	step_start_us = restore_tail_now_us();
 	if (prepare_aios(current, ta))
 		return -1;
+	prepare_aios_us = restore_tail_now_us() - step_start_us;
 
+	step_start_us = restore_tail_now_us();
 	if (fixup_sysv_shmems())
 		return -1;
+	fixup_sysv_shmems_us = restore_tail_now_us() - step_start_us;
 
+	step_start_us = restore_tail_now_us();
 	if (open_cores(pid, core))
 		return -1;
-	vma_open_us = restore_tail_now_us() - step_start_us;
+	open_cores_us = restore_tail_now_us() - step_start_us;
+	vma_open_us = open_vmas_us + prepare_aios_us + fixup_sysv_shmems_us + open_cores_us;
 
 	step_start_us = restore_tail_now_us();
 	if (prepare_signals(pid, ta, core))
@@ -867,10 +883,16 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 		return -1;
 	net_uffd_us = restore_tail_now_us() - step_start_us;
 
-	pr_info("%d: Restore task setup summary files=%llu ms vma-open=%llu ms state=%llu ms mm-vmas=%llu ms net-uffd=%llu ms total=%llu ms\n",
+	pr_info("%d: Restore task setup summary files=%llu ms (fdinfos=%llu locks=%llu) vma-open=%llu ms (open-vmas=%llu aios=%llu sysv-shmem=%llu cores=%llu) state=%llu ms mm-vmas=%llu ms net-uffd=%llu ms total=%llu ms\n",
 		pid,
 		(unsigned long long)(files_us / 1000ULL),
+		(unsigned long long)(prepare_fds_us / 1000ULL),
+		(unsigned long long)(file_locks_us / 1000ULL),
 		(unsigned long long)(vma_open_us / 1000ULL),
+		(unsigned long long)(open_vmas_us / 1000ULL),
+		(unsigned long long)(prepare_aios_us / 1000ULL),
+		(unsigned long long)(fixup_sysv_shmems_us / 1000ULL),
+		(unsigned long long)(open_cores_us / 1000ULL),
 		(unsigned long long)(task_state_us / 1000ULL),
 		(unsigned long long)(mm_vmas_us / 1000ULL),
 		(unsigned long long)(net_uffd_us / 1000ULL),

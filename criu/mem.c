@@ -1946,6 +1946,12 @@ int open_vmas(struct pstree_item *t)
 	} *last_per_fd = NULL;
 	int nr_last = 0, cap_last = 0;
 	int i, ret = -1;
+	struct timeval tv0, tv1;
+	unsigned long collect_ms = 0;
+	unsigned long unique_open_ms = 0;
+	unsigned long assign_ms = 0;
+
+	gettimeofday(&tv0, NULL);
 
 	/* Phase 1: non-filemap VMAs (shmem, socket) + plugin; collect filemap + memfd for parallel open */
 	list_for_each_entry(vma, &vmas->h, list) {
@@ -2008,17 +2014,23 @@ int open_vmas(struct pstree_item *t)
 				vma->e->status |= VMA_CLOSE;
 		}
 	}
+	gettimeofday(&tv1, NULL);
+	collect_ms = (unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000);
 
 	/* Phase 2: open unique files (AIO used for reads in restorer) */
 	if (nr_unique > 0)
 		pr_info("open_vmas: %d unique files, %d file-backed VMAs\n",
 			nr_unique, nr_parallel);
+	gettimeofday(&tv0, NULL);
 	if (open_vmas_unique_open(unique, nr_unique) < 0) {
 		pr_err("Open VMAs failed\n");
 		goto out;
 	}
+	gettimeofday(&tv1, NULL);
+	unique_open_ms = (unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000);
 
 	/* Phase 3: assign fds to VMAs */
+	gettimeofday(&tv0, NULL);
 	for (i = 0; i < nr_parallel; i++) {
 		int j, fd;
 
@@ -2031,6 +2043,8 @@ int open_vmas(struct pstree_item *t)
 		fd = unique[j].fd;
 		vma->e->fd = fd;
 	}
+	gettimeofday(&tv1, NULL);
+	assign_ms = (unsigned long)((tv1.tv_sec - tv0.tv_sec) * 1000 + (tv1.tv_usec - tv0.tv_usec) / 1000);
 
 	/* Phase 4: in list order, track last VMA per fd; then set VMA_CLOSE on each */
 	list_for_each_entry(vma, &vmas->h, list) {
@@ -2063,6 +2077,9 @@ int open_vmas(struct pstree_item *t)
 
 	for (i = 0; i < nr_last; i++)
 		last_per_fd[i].vma->e->status |= VMA_CLOSE;
+
+	pr_info("open_vmas summary collect=%lu ms unique-open=%lu ms assign=%lu ms total=%lu ms\n",
+		collect_ms, unique_open_ms, assign_ms, collect_ms + unique_open_ms + assign_ms);
 
 	ret = 0;
 out:

@@ -1909,6 +1909,13 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	u64 timers_us = 0;
 	u64 seccomp_us = 0;
 	u64 creds_us = 0;
+	u64 restore_stage_wait_us = 0;
+	u64 helpers_wait_us = 0;
+	u64 zombies_wait_us = 0;
+	u64 sigmask_us = 0;
+	u64 sigrestore_us = 0;
+	u64 sigchld_stage_wait_us = 0;
+	u64 tcp_restore_us = 0;
 
 	bootstrap_start = args->bootstrap_start;
 	bootstrap_len = args->bootstrap_len;
@@ -2654,23 +2661,37 @@ vma_restore_done:
 
 	pr_info("%ld: Restored\n", sys_getpid());
 
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE);
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	restore_stage_wait_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	if (wait_helpers(args) < 0)
 		goto core_restore_end;
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	helpers_wait_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
+
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	if (wait_zombies(args) < 0)
 		goto core_restore_end;
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	zombies_wait_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
 	ksigfillset(&to_block);
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	ret = sys_sigprocmask(SIG_SETMASK, &to_block, NULL, sizeof(k_rtsigset_t));
 	if (ret) {
 		pr_err("Unable to block signals %ld\n", ret);
 		goto core_restore_end;
 	}
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	sigmask_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
 	if (cleanup_current_inotify_events(args))
 		goto core_restore_end;
 
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	if (!args->compatible_mode) {
 		ret = sys_sigaction(SIGCHLD, &args->sigchld_act, NULL, sizeof(k_rtsigset_t));
 	} else {
@@ -2695,10 +2716,18 @@ vma_restore_done:
 	ret = restore_signals(args->t->siginfo, args->t->siginfo_n, false);
 	if (ret)
 		goto core_restore_end;
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	sigrestore_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	restore_finish_stage(task_entries_local, CR_STATE_RESTORE_SIGCHLD);
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	sigchld_stage_wait_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
+	sys_gettimeofday(&vma_map_tv0, NULL);
 	rst_tcp_socks_all(args);
+	sys_gettimeofday(&vma_map_tv1, NULL);
+	tcp_restore_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
 
 	/*
 	 * Make sure it's before creds, since it's privileged
@@ -2722,6 +2751,17 @@ vma_restore_done:
 	ret = ret || restore_child_subreaper(args->child_subreaper);
 	sys_gettimeofday(&vma_map_tv1, NULL);
 	creds_us = timeval_delta_us(&vma_map_tv0, &vma_map_tv1);
+
+	pr_info("Restorer post-page-replay summary restore-wait %lu ms helpers %lu ms zombies %lu ms sigmask %lu ms sigrestore %lu ms sigchld-wait %lu ms tcp %lu ms total %lu ms\n",
+		(unsigned long)(restore_stage_wait_us / 1000ULL),
+		(unsigned long)(helpers_wait_us / 1000ULL),
+		(unsigned long)(zombies_wait_us / 1000ULL),
+		(unsigned long)(sigmask_us / 1000ULL),
+		(unsigned long)(sigrestore_us / 1000ULL),
+		(unsigned long)(sigchld_stage_wait_us / 1000ULL),
+		(unsigned long)(tcp_restore_us / 1000ULL),
+		(unsigned long)((restore_stage_wait_us + helpers_wait_us + zombies_wait_us + sigmask_us +
+				 sigrestore_us + sigchld_stage_wait_us + tcp_restore_us) / 1000ULL));
 
 	pr_info("Restorer phase summary shift %lu ms map %lu ms page-io %lu ms mprotect %lu ms aio-rings %lu ms madvise %lu ms guard %lu ms threads %lu ms timers %lu ms seccomp %lu ms creds %lu ms\n",
 		(unsigned long)(vma_shift_us / 1000ULL),

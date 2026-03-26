@@ -1176,9 +1176,14 @@ out_log:
 		unsigned long sort_ms = (unsigned long)((tv3.tv_sec - tv2.tv_sec) * 1000 + (tv3.tv_usec - tv2.tv_usec) / 1000);
 		unsigned long replay_ms = (unsigned long)((tv_end.tv_sec - tv4.tv_sec) * 1000 + (tv_end.tv_usec - tv4.tv_usec) / 1000);
 
-		pr_info("compact page replay %lu ms (index %lu ms sort %lu ms replay %lu ms, %lu unique pages, %lu duplicate pages, %lu zero pages, %lu runs)\n",
-			total_ms,
-			index_ms, sort_ms, replay_ms, nr_groups, duplicate_pages, zero_pages, nr_runs);
+		(void)total_ms;
+		(void)index_ms;
+		(void)sort_ms;
+		(void)replay_ms;
+		(void)nr_groups;
+		(void)duplicate_pages;
+		(void)zero_pages;
+		(void)nr_runs;
 	}
 
 out:
@@ -1621,8 +1626,6 @@ int pagemap_render_iovec(struct list_head *from, struct task_restore_args *ta)
 		struct restore_vma_io *rio;
 		struct restore_vma_copy *copies;
 
-		pr_info("`- render %d iovs + %u copies (%p:%zd...)\n",
-			piov->nr, piov->nr_copies, piov->to[0].iov_base, piov->to[0].iov_len);
 		rio = rst_mem_alloc(RIO_SIZE(piov->nr, piov->nr_copies), RM_PRIVATE);
 		if (!rio)
 			return -1;

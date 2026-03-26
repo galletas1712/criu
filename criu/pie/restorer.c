@@ -1102,8 +1102,6 @@ static int vma_remap(VmaEntry *vma_entry, int uffd)
 	unsigned long len = vma_entry_len(vma_entry);
 	unsigned long guard = 0, tmp;
 
-	pr_info("Remap %lx->%lx len %lx\n", src, dst, len);
-
 	/*
 	 * SHSTK VMAs are a bit special, in fact we create shstk vma right in the
 	 * shstk_vma_restore() and populate it with contents from a premapped VMA

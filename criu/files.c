@@ -850,8 +850,6 @@ int collect_fd(int pid, FdinfoEntry *e, struct rst_info *rst_info, bool fake)
 {
 	struct file_desc *fdesc;
 
-	pr_info("Collect fdinfo pid=%d fd=%d id=%#x\n", pid, e->fd, e->id);
-
 	fdesc = find_file_desc(e);
 	if (fdesc == NULL) {
 		pr_err("No file for fd %d id %#x\n", e->fd, e->id);
@@ -1016,7 +1014,6 @@ static int recv_fd_from_peer(struct fdinfo_list_entry *fle)
 		else if (ret)
 			return -1;
 
-		pr_info("Further fle=%p, pid=%d\n", tmp, fle->pid);
 		if (!task_fle(current, tmp)) {
 			pr_err("Unexpected fle %p, pid=%d\n", tmp, vpid(current));
 			return -1;
@@ -1036,7 +1033,6 @@ static int send_fd_to_peer(int fd, struct fdinfo_list_entry *fle)
 	sock = get_service_fd(TRANSPORT_FD_OFF);
 
 	transport_name_gen(&saddr, &len, fle->pid);
-	pr_info("\t\tSend fd %d to %s\n", fd, saddr.sun_path + 1);
 	ret = send_fds(sock, &saddr, len, &fd, 1, (void *)&fle, sizeof(struct fdinfo_list_entry *));
 	if (ret < 0)
 		return -1;
@@ -1174,8 +1170,6 @@ out:
 static int receive_fd(struct fdinfo_list_entry *fle)
 {
 	int ret;
-
-	pr_info("\tReceive fd for %d\n", fle->fe->fd);
 
 	ret = recv_fd_from_peer(fle);
 	if (ret != 0) {

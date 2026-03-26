@@ -988,8 +988,6 @@ int prepare_mm_pid(struct pstree_item *i)
 				ri->vmas.rst_priv_size += PAGE_SIZE;
 		}
 
-		pr_info("vma 0x%" PRIx64 " 0x%" PRIx64 "\n", vma->e->start, vma->e->end);
-
 		if (vma_area_is(vma, VMA_ANON_SHARED))
 			ret = collect_shmem(pid, vma);
 		else if (vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED))
@@ -1035,7 +1033,6 @@ static inline bool check_cow_vmas(struct vma_area *vma, struct vma_area *pvma)
 	if (!(vma->e->flags & MAP_ANONYMOUS) && vma->e->shmid != pvma->e->shmid)
 		return false;
 
-	pr_debug("Found two COW VMAs @0x%" PRIx64 "-0x%" PRIx64 "\n", vma->e->start, pvma->e->end);
 	return true;
 }
 
@@ -1957,9 +1954,6 @@ int open_vmas(struct pstree_item *t)
 	list_for_each_entry(vma, &vmas->h, list) {
 		if (!vma_area_is(vma, VMA_AREA_REGULAR) || !vma->vm_open)
 			continue;
-
-		pr_info("Opening %#016" PRIx64 "-%#016" PRIx64 " %#016" PRIx64 " (%x) vma\n", vma->e->start,
-			vma->e->end, vma->e->pgoff, vma->e->status);
 
 		if (vma_area_is(vma, VMA_FILE_PRIVATE) || vma_area_is(vma, VMA_FILE_SHARED)) {
 			bool is_plugin = !!(vma->e->status & VMA_EXT_PLUGIN);

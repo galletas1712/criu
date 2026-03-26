@@ -771,6 +771,8 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 	u64 fixup_sysv_shmems_us = 0;
 	u64 open_cores_us = 0;
 	u64 task_state_us = 0;
+	u64 deferred_premap_us = 0;
+	u64 deferred_guard_us = 0;
 	u64 mm_vmas_us = 0;
 	u64 net_uffd_us = 0;
 	u64 step_start_us;
@@ -860,6 +862,18 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 		return -1;
 	task_state_us = restore_tail_now_us() - step_start_us;
 
+	if (!rsti(current)->premmapped_addr && rsti(current)->vmas.rst_priv_size > 0) {
+		step_start_us = restore_tail_now_us();
+		if (prepare_mappings(current))
+			return -1;
+		deferred_premap_us = restore_tail_now_us() - step_start_us;
+
+		step_start_us = restore_tail_now_us();
+		if (unmap_guard_pages(current))
+			return -1;
+		deferred_guard_us = restore_tail_now_us() - step_start_us;
+	}
+
 	step_start_us = restore_tail_now_us();
 	if (prepare_mm(pid, ta))
 		return -1;
@@ -883,7 +897,7 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 		return -1;
 	net_uffd_us = restore_tail_now_us() - step_start_us;
 
-	pr_info("%d: Restore task setup summary files=%llu ms (fdinfos=%llu locks=%llu) vma-open=%llu ms (open-vmas=%llu aios=%llu sysv-shmem=%llu cores=%llu) state=%llu ms mm-vmas=%llu ms net-uffd=%llu ms total=%llu ms\n",
+	pr_info("%d: Restore task setup summary files=%llu ms (fdinfos=%llu locks=%llu) vma-open=%llu ms (open-vmas=%llu aios=%llu sysv-shmem=%llu cores=%llu) state=%llu ms deferred-premap=%llu ms deferred-guard=%llu ms mm-vmas=%llu ms net-uffd=%llu ms total=%llu ms\n",
 		pid,
 		(unsigned long long)(files_us / 1000ULL),
 		(unsigned long long)(prepare_fds_us / 1000ULL),
@@ -894,6 +908,8 @@ static int restore_one_alive_task(int pid, CoreEntry *core)
 		(unsigned long long)(fixup_sysv_shmems_us / 1000ULL),
 		(unsigned long long)(open_cores_us / 1000ULL),
 		(unsigned long long)(task_state_us / 1000ULL),
+		(unsigned long long)(deferred_premap_us / 1000ULL),
+		(unsigned long long)(deferred_guard_us / 1000ULL),
 		(unsigned long long)(mm_vmas_us / 1000ULL),
 		(unsigned long long)(net_uffd_us / 1000ULL),
 		(unsigned long long)((restore_tail_now_us() - total_start_us) / 1000ULL));
@@ -1691,6 +1707,7 @@ static int __restore_task_with_children(void *_arg)
 	struct cr_clone_arg *ca = _arg;
 	pid_t pid;
 	int ret;
+	bool defer_prepare_mappings;
 	__maybe_unused u64 total_start_us = restore_tail_now_us();
 	__maybe_unused u64 mnt_ns_us = 0;
 	__maybe_unused u64 prepare_mappings_us = 0;
@@ -1702,6 +1719,7 @@ static int __restore_task_with_children(void *_arg)
 	__maybe_unused u64 step_start_us;
 
 	current = ca->item;
+	defer_prepare_mappings = !has_children(current);
 
 	if (current != root_item) {
 		char buf[12];
@@ -1829,10 +1847,12 @@ static int __restore_task_with_children(void *_arg)
 		goto err;
 	mnt_ns_us = restore_tail_now_us() - step_start_us;
 
-	step_start_us = restore_tail_now_us();
-	if (prepare_mappings(current))
-		goto err;
-	prepare_mappings_us = restore_tail_now_us() - step_start_us;
+	if (!defer_prepare_mappings) {
+		step_start_us = restore_tail_now_us();
+		if (prepare_mappings(current))
+			goto err;
+		prepare_mappings_us = restore_tail_now_us() - step_start_us;
+	}
 
 	step_start_us = restore_tail_now_us();
 	if (prepare_sigactions(ca->core) < 0)
@@ -1864,7 +1884,7 @@ static int __restore_task_with_children(void *_arg)
 
 	sfds_protected = true;
 
-	if (unmap_guard_pages(current))
+	if (!defer_prepare_mappings && unmap_guard_pages(current))
 		goto err;
 	proc_misc_us = restore_tail_now_us() - step_start_us;
 

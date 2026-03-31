@@ -63,6 +63,20 @@ static bool tcp_listener_disallowed_by_policy(int family, const u32 *src_addr)
 	return opts.tcp_loopback_only && !is_loopback_addr(family, src_addr);
 }
 
+static bool tcp_sk_entry_has_addr(const InetSkEntry *ie, size_t n_addr, const u32 *addr)
+{
+	if (!addr)
+		return false;
+
+	if (ie->family == AF_INET)
+		return n_addr >= 1;
+
+	if (ie->family == AF_INET6)
+		return n_addr >= 4;
+
+	return false;
+}
+
 bool tcp_sk_desc_should_restore_closed(const struct inet_sk_desc *sk)
 {
 	if (sk->type != SOCK_STREAM || sk->dst_port == 0)
@@ -90,7 +104,8 @@ enum tcp_socket_restore_mode tcp_sk_entry_restore_mode(const InetSkEntry *ie)
 	if (ie->proto != IPPROTO_TCP || ie->dst_port == 0)
 		return TCP_SOCKET_RESTORE_NONE;
 
-	if (ie->n_src_addr == 0 || !ie->src_addr || ie->n_dst_addr == 0 || !ie->dst_addr)
+	if (!tcp_sk_entry_has_addr(ie, ie->n_src_addr, ie->src_addr) ||
+	    !tcp_sk_entry_has_addr(ie, ie->n_dst_addr, ie->dst_addr))
 		return TCP_SOCKET_RESTORE_UNSUPPORTED;
 
 	if (opts.tcp_close)
@@ -110,7 +125,7 @@ bool tcp_sk_entry_has_disallowed_listener(const InetSkEntry *ie)
 	if (ie->proto != IPPROTO_TCP || ie->state != TCP_LISTEN)
 		return false;
 
-	if (ie->n_src_addr == 0 || !ie->src_addr)
+	if (!tcp_sk_entry_has_addr(ie, ie->n_src_addr, ie->src_addr))
 		return false;
 
 	return tcp_listener_disallowed_by_policy(ie->family, ie->src_addr);

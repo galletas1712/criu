@@ -104,6 +104,9 @@ TST_NOFILE	:=				\
 		socket-tcp-loopback-only	\
 		socket-tcp-loopback-only-close	\
 		socket-tcp-loopback-only-listen	\
+		socket-tcp-loopback-only-wildcard \
+		socket-tcp6-loopback-only-wildcard \
+		socket-tcp-loopback-only-skip-in-flight \
 		socket-tcpbuf			\
 		socket-tcpbuf-local		\
 		socket-tcpbuf6-local		\

@@ -50,6 +50,14 @@ struct inet_sk_desc {
 };
 
 struct inet_port;
+
+enum tcp_socket_restore_mode {
+	TCP_SOCKET_RESTORE_NONE,
+	TCP_SOCKET_RESTORE_REPAIR,
+	TCP_SOCKET_RESTORE_CLOSED,
+	TCP_SOCKET_RESTORE_UNSUPPORTED,
+};
+
 struct inet_sk_info {
 	InetSkEntry *ie;
 	struct file_desc d;
@@ -58,10 +66,10 @@ struct inet_sk_info {
 	/*
 	 * This is an fd by which the socket is opened.
 	 * It will be carried down to restorer code to
- * repair-off the socket at the very end.
+	 * repair-off the socket at the very end.
 	 */
 	int sk_fd;
-	bool restore_as_closed;
+	enum tcp_socket_restore_mode restore_mode;
 	struct list_head rlist;
 };
 
@@ -87,9 +95,10 @@ extern void cpt_unlock_tcp_connections(void);
 
 extern int dump_one_tcp(int sk, struct inet_sk_desc *sd, SkOptsEntry *soe);
 extern int restore_one_tcp(int sk, struct inet_sk_info *si);
-extern bool tcp_sk_desc_needs_loopback_only_close(const struct inet_sk_desc *sk);
-extern bool tcp_sk_desc_has_unsafe_loopback_only_listener(const struct inet_sk_desc *sk);
-extern bool tcp_sk_entry_needs_loopback_only_close(const InetSkEntry *ie);
+extern bool tcp_sk_desc_should_restore_closed(const struct inet_sk_desc *sk);
+extern bool tcp_sk_desc_has_disallowed_listener(const struct inet_sk_desc *sk);
+extern enum tcp_socket_restore_mode tcp_sk_entry_restore_mode(const InetSkEntry *ie);
+extern bool tcp_sk_entry_has_disallowed_listener(const InetSkEntry *ie);
 
 extern int dump_tcp_opts(int sk, TcpOptsEntry *toe);
 extern int restore_tcp_opts(int sk, TcpOptsEntry *toe);

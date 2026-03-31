@@ -172,6 +172,12 @@ static int can_dump_inet_sk(const struct inet_sk_desc *sk)
 
 	switch (sk->state) {
 	case TCP_LISTEN:
+		if (tcp_sk_desc_has_disallowed_listener(sk)) {
+			pr_err("TCP listener %x is not allowed with --%s unless it is bound to loopback.\n",
+			       sk->sd.ino, SK_LOOPBACK_ONLY_PARAM);
+			return 0;
+		}
+
 		if (sk->rqlen != 0) {
 			if (opts.tcp_skip_in_flight) {
 				pr_info("Skipping in-flight connection (l) for %x\n", sk->sd.ino);
@@ -186,12 +192,6 @@ static int can_dump_inet_sk(const struct inet_sk_desc *sk)
 			pr_err("In-flight connections can be ignored with the "
 			       "--%s option.\n",
 			       SK_INFLIGHT_PARAM);
-			return 0;
-		}
-
-		if (tcp_sk_desc_has_unsafe_loopback_only_listener(sk)) {
-			pr_err("Non-loopback TCP listener %x is not allowed with --%s.\n", sk->sd.ino,
-			       SK_LOOPBACK_ONLY_PARAM);
 			return 0;
 		}
 		break;
@@ -716,8 +716,8 @@ static int collect_one_inetsk(void *o, ProtobufCMessage *base, struct cr_img *i)
 	struct inet_sk_info *ii = o;
 
 	ii->ie = pb_msg(base, InetSkEntry);
-	ii->restore_as_closed = tcp_sk_entry_needs_loopback_only_close(ii->ie);
-	if (tcp_connection(ii->ie) && !ii->restore_as_closed)
+	ii->restore_mode = tcp_sk_entry_restore_mode(ii->ie);
+	if (ii->restore_mode == TCP_SOCKET_RESTORE_REPAIR)
 		tcp_locked_conn_add(ii);
 
 	/*
@@ -780,7 +780,7 @@ static int post_open_inet_sk(struct file_desc *d, int sk)
 	 * after unlocking connections.
 	 */
 	if (tcp_connection(ii->ie)) {
-		if (ii->restore_as_closed)
+		if (ii->restore_mode != TCP_SOCKET_RESTORE_REPAIR)
 			return 0;
 
 		pr_debug("Schedule %d socket for repair off\n", sk);
@@ -919,7 +919,7 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 		goto err;
 
 	if (tcp_connection(ie)) {
-		if (!opts.tcp_established_ok && !opts.tcp_close && !opts.tcp_loopback_only) {
+		if (ii->restore_mode == TCP_SOCKET_RESTORE_UNSUPPORTED) {
 			pr_err("Connected TCP socket in image\n");
 			goto err;
 		}
@@ -947,6 +947,12 @@ static int open_inet_sk(struct file_desc *d, int *new_fd)
 	if (ie->state == TCP_LISTEN) {
 		if (ie->proto != IPPROTO_TCP) {
 			pr_err("Wrong socket in listen state %d\n", ie->proto);
+			goto err;
+		}
+
+		if (tcp_sk_entry_has_disallowed_listener(ie)) {
+			pr_err("TCP listener id %x ino %x is not allowed with --%s unless it is bound to loopback.\n",
+			       ie->id, ie->ino, SK_LOOPBACK_ONLY_PARAM);
 			goto err;
 		}
 

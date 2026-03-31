@@ -34,90 +34,86 @@
 static LIST_HEAD(cpt_tcp_repair_sockets);
 static LIST_HEAD(rst_tcp_repair_sockets);
 
-static bool is_wildcard_addr(int family, const u32 *addr)
-{
-	static const unsigned char v6_any[16];
-	static const unsigned char v4_mapped_prefix[12] = {
-		[10] = 0xff,
-		[11] = 0xff,
-	};
-	const unsigned char *bytes = (const unsigned char *)addr;
-
-	if (family == AF_INET)
-		return addr[0] == 0;
-
-	if (family == AF_INET6) {
-		if (!memcmp(bytes, v6_any, sizeof(v6_any)))
-			return true;
-
-		if (!memcmp(bytes, v4_mapped_prefix, sizeof(v4_mapped_prefix)))
-			return addr[3] == 0;
-	}
-
-	return false;
-}
-
 static bool is_loopback_addr(int family, const u32 *addr)
 {
-	static const unsigned char v6_loopback[16] = {
-		[15] = 1,
-	};
-	static const unsigned char v4_mapped_prefix[12] = {
-		[10] = 0xff,
-		[11] = 0xff,
-	};
-	const unsigned char *bytes = (const unsigned char *)addr;
+	const struct in_addr *addr4 = (const struct in_addr *)addr;
+	const struct in6_addr *addr6 = (const struct in6_addr *)addr;
 
 	if (family == AF_INET)
-		return bytes[0] == 127;
+		return IN_LOOPBACK(ntohl(addr4->s_addr));
 
 	if (family == AF_INET6) {
-		if (!memcmp(bytes, v6_loopback, sizeof(v6_loopback)))
+		if (IN6_IS_ADDR_LOOPBACK(addr6))
 			return true;
 
-		if (!memcmp(bytes, v4_mapped_prefix, sizeof(v4_mapped_prefix)))
-			return bytes[12] == 127;
+		if (IN6_IS_ADDR_V4MAPPED(addr6))
+			return IN_LOOPBACK(ntohl(addr6->s6_addr32[3]));
 	}
 
 	return false;
 }
 
-static bool is_loopback_or_wildcard_addr(int family, const u32 *addr)
+static bool tcp_connected_socket_should_restore_closed(int family, const u32 *src_addr, const u32 *dst_addr)
 {
-	return is_wildcard_addr(family, addr) || is_loopback_addr(family, addr);
+	return !is_loopback_addr(family, src_addr) || !is_loopback_addr(family, dst_addr);
 }
 
-bool tcp_sk_desc_needs_loopback_only_close(const struct inet_sk_desc *sk)
+static bool tcp_listener_disallowed_by_policy(int family, const u32 *src_addr)
 {
-	if (!opts.tcp_loopback_only || sk->type != SOCK_STREAM || sk->dst_port == 0)
+	return opts.tcp_loopback_only && !is_loopback_addr(family, src_addr);
+}
+
+bool tcp_sk_desc_should_restore_closed(const struct inet_sk_desc *sk)
+{
+	if (sk->type != SOCK_STREAM || sk->dst_port == 0)
 		return false;
 
-	if (!is_loopback_or_wildcard_addr(sk->sd.family, sk->src_addr))
+	if (opts.tcp_close)
 		return true;
 
-	return !is_loopback_or_wildcard_addr(sk->sd.family, sk->dst_addr);
-}
-
-bool tcp_sk_desc_has_unsafe_loopback_only_listener(const struct inet_sk_desc *sk)
-{
-	if (!opts.tcp_loopback_only || sk->type != SOCK_STREAM || sk->state != TCP_LISTEN)
+	if (!opts.tcp_loopback_only)
 		return false;
 
-	return !is_loopback_or_wildcard_addr(sk->sd.family, sk->src_addr);
+	return tcp_connected_socket_should_restore_closed(sk->sd.family, sk->src_addr, sk->dst_addr);
 }
 
-bool tcp_sk_entry_needs_loopback_only_close(const InetSkEntry *ie)
+bool tcp_sk_desc_has_disallowed_listener(const struct inet_sk_desc *sk)
 {
-	if (!opts.tcp_loopback_only || ie->proto != IPPROTO_TCP || ie->dst_port == 0)
+	if (sk->type != SOCK_STREAM || sk->state != TCP_LISTEN)
 		return false;
+
+	return tcp_listener_disallowed_by_policy(sk->sd.family, sk->src_addr);
+}
+
+enum tcp_socket_restore_mode tcp_sk_entry_restore_mode(const InetSkEntry *ie)
+{
+	if (ie->proto != IPPROTO_TCP || ie->dst_port == 0)
+		return TCP_SOCKET_RESTORE_NONE;
 
 	if (ie->n_src_addr == 0 || !ie->src_addr || ie->n_dst_addr == 0 || !ie->dst_addr)
+		return TCP_SOCKET_RESTORE_UNSUPPORTED;
+
+	if (opts.tcp_close)
+		return TCP_SOCKET_RESTORE_CLOSED;
+
+	if (opts.tcp_loopback_only && tcp_connected_socket_should_restore_closed(ie->family, ie->src_addr, ie->dst_addr))
+		return TCP_SOCKET_RESTORE_CLOSED;
+
+	if (opts.tcp_established_ok || opts.tcp_loopback_only)
+		return TCP_SOCKET_RESTORE_REPAIR;
+
+	return TCP_SOCKET_RESTORE_UNSUPPORTED;
+}
+
+bool tcp_sk_entry_has_disallowed_listener(const InetSkEntry *ie)
+{
+	if (ie->proto != IPPROTO_TCP || ie->state != TCP_LISTEN)
 		return false;
 
-	if (!is_loopback_or_wildcard_addr(ie->family, ie->src_addr))
-		return true;
+	if (ie->n_src_addr == 0 || !ie->src_addr)
+		return false;
 
-	return !is_loopback_or_wildcard_addr(ie->family, ie->dst_addr);
+	return tcp_listener_disallowed_by_policy(ie->family, ie->src_addr);
 }
 
 static int lock_connection(struct inet_sk_desc *sk)
@@ -334,9 +330,8 @@ int dump_one_tcp(int fd, struct inet_sk_desc *sk, SkOptsEntry *soe)
 	if (sk->dst_port == 0)
 		return 0;
 
-	if (tcp_sk_desc_needs_loopback_only_close(sk)) {
-		pr_info("Skipping TCP stream dump for non-loopback socket %x; it will be restored closed\n",
-			sk->sd.ino);
+	if (tcp_sk_desc_should_restore_closed(sk)) {
+		pr_info("Skipping TCP stream dump for socket %x; it will be restored closed\n", sk->sd.ino);
 		return 0;
 	}
 
@@ -554,13 +549,19 @@ int restore_one_tcp(int fd, struct inet_sk_info *ii)
 
 	pr_info("Restoring TCP connection\n");
 
-	if (opts.tcp_close || tcp_sk_entry_needs_loopback_only_close(ii->ie)) {
+	if (ii->restore_mode == TCP_SOCKET_RESTORE_CLOSED) {
 		if (!opts.tcp_close)
 			pr_info("Restoring non-loopback TCP socket id %x ino %x as closed\n", ii->ie->id, ii->ie->ino);
 		if (shutdown(fd, SHUT_RDWR) && errno != ENOTCONN) {
 			pr_perror("Unable to shutdown the socket id %x ino %x", ii->ie->id, ii->ie->ino);
 		}
 		return 0;
+	}
+
+	if (ii->restore_mode != TCP_SOCKET_RESTORE_REPAIR) {
+		pr_err("Unexpected TCP restore mode %d for socket id %x ino %x\n", ii->restore_mode, ii->ie->id,
+		       ii->ie->ino);
+		return -1;
 	}
 
 	sk = libsoccr_pause(fd);

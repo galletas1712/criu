@@ -632,6 +632,16 @@ int pagemap_enqueue_iovec(struct page_read *pr, void *buf, unsigned long len, st
 		return enqueue_async_iov(pr, buf, len, to);
 
 	/*
+	 * Cap the size of compressed async batches to avoid allocating
+	 * a single decompression buffer for the entire checkpoint.
+	 * For a 77 GiB checkpoint the buffer alone would exceed host
+	 * RAM. Limit to 1 GiB of compressed data per batch.
+	 */
+#define ASYNC_COMPRESSED_BATCH_LIMIT (1ULL << 30) /* 1 GiB */
+	if (cur_async->total_compressed_size >= ASYNC_COMPRESSED_BATCH_LIMIT)
+		return enqueue_async_iov(pr, buf, len, to);
+
+	/*
 	 * This read is pure continuation of the previous one. Let's
 	 * just add another IOV (or extend one of the existing).
 	 */

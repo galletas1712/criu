@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <string.h>
 
 #include "common/config.h"
 #include "common/list.h"
@@ -33,6 +34,13 @@
 #define SEEK_DATA 3
 #define SEEK_HOLE 4
 #endif
+
+static const unsigned char zero_page[PAGE_SIZE] __attribute__((aligned(PAGE_SIZE)));
+
+static bool shmem_page_is_all_zero(const void *page)
+{
+	return memcmp(page, zero_page, PAGE_SIZE) == 0;
+}
 
 /*
  * Hash table and routines for keeping shmid -> shmem_xinfo mappings
@@ -782,6 +790,9 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 	int err, ret = -1;
 	unsigned long pfn, nrpages, next_data_pnf = 0, next_hole_pfn = 0;
 	unsigned long pages[2] = {};
+	unsigned long sparse_zero_pages = 0;
+	unsigned long allocated_zero_pages = 0;
+	unsigned long allocated_nonzero_pages = 0;
 
 	nrpages = (si->size + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -800,6 +811,7 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 		bool use_mc = true;
 		unsigned long pgaddr;
 		int st = -1;
+		bool allocated_page_is_zero = false;
 
 		if (fd >= 0 && pfn >= next_hole_pfn && next_data_segment(fd, pfn, &next_data_pnf, &next_hole_pfn))
 			goto err_xfer;
@@ -824,6 +836,7 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 			ret = page_pipe_add_hole(pp, pgaddr, PP_HOLE_PARENT);
 			st = 0;
 		} else {
+			allocated_page_is_zero = shmem_page_is_all_zero((void *)pgaddr);
 			ret = page_pipe_add_page(pp, pgaddr, 0);
 			st = 1;
 		}
@@ -837,6 +850,14 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 		} else if (ret)
 			goto err_xfer;
 
+		if (pgstate == PST_ZERO) {
+			sparse_zero_pages++;
+		} else if (st == 1 && allocated_page_is_zero) {
+			allocated_zero_pages++;
+		} else if (st == 1) {
+			allocated_nonzero_pages++;
+		}
+
 		if (st >= 0)
 			pages[st]++;
 	}
@@ -846,6 +867,12 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 	cnt_add(CNT_SHPAGES_WRITTEN, pages[1]);
 
 	ret = dump_pages(pp, &xfer);
+	if (!ret)
+		pr_info("Shmem zero scan summary shmid=%#lx size=%lu total_pages=%lu sparse_zero_pages=%lu allocated_zero_pages=%lu allocated_nonzero_pages=%lu parent_pages=%lu written_pages=%lu allocated_zero_bytes=%llu allocated_nonzero_bytes=%llu\n",
+			si->shmid, si->size, nrpages, sparse_zero_pages, allocated_zero_pages,
+			allocated_nonzero_pages, pages[0], pages[1],
+			(unsigned long long)allocated_zero_pages * PAGE_SIZE,
+			(unsigned long long)allocated_nonzero_pages * PAGE_SIZE);
 
 err_xfer:
 	xfer.close(&xfer);

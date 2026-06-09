@@ -1293,6 +1293,14 @@ static inline bool nfs_silly_rename(char *rpath, const struct fd_parms *parms)
 	return (parms->fs_type == NFS_SUPER_MAGIC) && is_sillyrename_name(rpath);
 }
 
+static inline bool is_dev_shm_posix_sem(char *rpath, const struct fd_parms *parms)
+{
+	if (parms->fs_type != TMPFS_MAGIC)
+		return false;
+
+	return !strncmp(rpath, "./dev/shm/sem.", sizeof("./dev/shm/sem.") - 1);
+}
+
 static int check_path_remap(struct fd_link *link, const struct fd_parms *parms, int lfd, u32 id, struct ns_id *nsid)
 {
 	char *rpath = link->name;
@@ -1369,6 +1377,12 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms, 
 		 * no longer exist.
 		 */
 		return 0;
+	}
+
+	if (is_dev_shm_posix_sem(rpath, parms)) {
+		link_strip_deleted(link);
+		pr_info("Dumping /dev/shm POSIX semaphore as ghost remap for restore portability\n");
+		return dump_ghost_remap(rpath + 1, ost, lfd, id, nsid);
 	}
 
 	if (ost->st_nlink == 0) {

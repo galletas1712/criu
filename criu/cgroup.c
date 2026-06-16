@@ -2091,7 +2091,7 @@ static int prepare_cgroup_thread_sfd(void)
 {
 	int sk;
 
-	sk = start_unix_cred_daemon(&cgroupd_pid, cgroupd);
+	sk = start_unix_cred_daemon(&cgroupd_pid, cgroupd, true);
 	if (sk < 0) {
 		pr_err("failed to start cgroupd\n");
 		return -1;

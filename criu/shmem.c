@@ -544,7 +544,6 @@ int restore_memfd_shmem_content(int fd, unsigned long shmid, unsigned long size)
 	}
 
 	ret = 0;
-
 out:
 	if (addr)
 		munmap(addr, size);

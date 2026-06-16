@@ -3,6 +3,7 @@
 
 #include "common/compiler.h"
 #include "common/lock.h"
+#include "cr_options.h"
 #include "memfd.h"
 #include "fdinfo.h"
 #include "imgset.h"
@@ -17,6 +18,7 @@
 #include "fdstore.h"
 #include "file-ids.h"
 #include "namespaces.h"
+#include "asyncd.h"
 #include "shmem.h"
 #include "hugetlb.h"
 
@@ -254,11 +256,26 @@ int prepare_memfd_inodes(void)
 	return collect_image(&memfd_inode_cinfo);
 }
 
+struct async_shmem_arg {
+	MemfdInodeEntry *mie;
+};
+
+int async_restore_memfd_shmem_content(void *arg, int fd, pid_t pid)
+{
+	MemfdInodeEntry *mie = ((struct async_shmem_arg *)arg)->mie;
+
+	if (restore_memfd_shmem_content(fd, mie->shmid, mie->size))
+		return -1;
+
+	return 0;
+}
+
 static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 {
+	struct async_shmem_arg async_arg;
 	MemfdInodeEntry *mie = NULL;
 	int fd = -1;
-	int ret = -1;
+	int ret, exit_code = -1;
 	int flags;
 
 	mie = inode->mie;
@@ -277,11 +294,24 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 	fd = memfd_create(mie->name, flags);
 	if (fd < 0) {
 		pr_perror("Can't create memfd:%s", mie->name);
-		goto out;
+		goto err;
 	}
 
-	if (restore_memfd_shmem_content(fd, mie->shmid, mie->size))
-		goto out;
+	if (opts.stream) {
+		/*
+		 * criu-image-streamer serves the image in a single sequential
+		 * pass and does not reopen it. The async fill daemon reads the
+		 * memfd content out-of-band from a separate process, which
+		 * breaks that contract, so fill inline when restoring from a
+		 * stream.
+		 */
+		if (restore_memfd_shmem_content(fd, mie->shmid, mie->size))
+			goto err;
+	} else {
+		async_arg.mie = mie;
+		if (async_call(async_restore_memfd_shmem_content, 0, (void *)&async_arg, sizeof(async_arg), fd))
+			goto err;
+	}
 
 	if (mie->has_mode)
 		ret = cr_fchperm(fd, mie->uid, mie->gid, mie->mode);
@@ -290,20 +320,19 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 	if (ret) {
 		pr_perror("Can't set permissions { uid %d gid %d mode %#o } of memfd:%s", (int)mie->uid,
 			  (int)mie->gid, mie->has_mode ? (int)mie->mode : -1, mie->name);
-		goto out;
+		goto err;
 	}
 
 	inode->fdstore_id = fdstore_add(fd);
 	if (inode->fdstore_id < 0)
-		goto out;
+		goto err;
 
-	ret = fd;
+	exit_code = fd;
 	fd = -1;
 
-out:
-	if (fd != -1)
-		close(fd);
-	return ret;
+err:
+	close_safe(&fd);
+	return exit_code;
 }
 
 static int memfd_open_inode(struct memfd_restore_inode *inode)

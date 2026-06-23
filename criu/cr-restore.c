@@ -1710,6 +1710,8 @@ static int __restore_task_with_children(void *_arg)
 err:
 	if (current->parent == NULL)
 		futex_abort_and_wake(&task_entries->nr_in_progress);
+	/* Reap the async daemon if it was started (no-op otherwise). */
+	stop_asyncd();
 	exit(1);
 }
 
@@ -3611,6 +3613,8 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 err:
 	free_mappings(&self_vmas);
 err_nv:
+	/* Reap the async daemon if it is still running (no-op otherwise). */
+	stop_asyncd();
 	/* Just to be sure */
 	exit(1);
 	return -1;

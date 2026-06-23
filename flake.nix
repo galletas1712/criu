@@ -32,6 +32,7 @@
           libnet
           libnl
           libaio
+          lz4
           gnutls
           libdrm
 

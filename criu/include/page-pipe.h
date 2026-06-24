@@ -95,7 +95,8 @@ struct page_pipe_buf {
 	unsigned int nr_segs;	/* how many iov-s are busy */
 	unsigned long pipe_off;	/* where this buf is started in a pipe */
 	unsigned long pages_in;	/* how many pages are there */
-#define PPB_LAZY (1 << 0)
+#define PPB_LAZY      (1 << 0)
+#define PPB_ZERO_SKIP (1 << 1)
 	unsigned int flags;
 	struct iovec *iov;  /* vaddr:len map */
 	struct list_head l; /* links into page_pipe->bufs */
@@ -105,10 +106,9 @@ struct page_pipe_buf {
  * Page pipe buffers with different flags cannot share the same pipe.
  * We track the last ppb that was used for each type separately in the
  * prev[] array in the struct page_pipe (below).
- * Currently we have 2 types: the buffers that are always stored in
- * the images and the buffers that are lazily migrated
+ * Currently we track buffers by the lazy and zero-skip bits.
  */
-#define PP_PIPE_TYPES 2
+#define PP_PIPE_TYPES 4
 
 #define PP_HOLE_PARENT (1 << 0)
 

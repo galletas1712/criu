@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <string.h>
 
 #include "common/config.h"
 #include "common/list.h"
@@ -34,6 +35,18 @@
 #define SEEK_DATA 3
 #define SEEK_HOLE 4
 #endif
+
+static bool shmem_page_is_all_zero(const void *page)
+{
+	const unsigned char *p = page;
+	unsigned long i, size = PAGE_SIZE;
+
+	for (i = 0; i < size; i++)
+		if (p[i])
+			return false;
+
+	return true;
+}
 
 /*
  * Hash table and routines for keeping shmid -> shmem_xinfo mappings
@@ -772,6 +785,10 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 	int err, ret = -1;
 	unsigned long pfn, nrpages, next_data_pnf = 0, next_hole_pfn = 0;
 	unsigned long pages[2] = {};
+	unsigned long sparse_zero_pages = 0;
+	unsigned long skipped_zero_pages = 0;
+	unsigned long written_zero_pages = 0;
+	unsigned long written_nonzero_pages = 0;
 
 	nrpages = (si->size + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -790,6 +807,8 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 		bool use_mc = true;
 		unsigned long pgaddr;
 		int st = -1;
+		bool allocated_page_is_zero = false;
+		bool skipped_allocated_zero_page = false;
 
 		if (fd >= 0 && pfn >= next_hole_pfn && next_data_segment(fd, pfn, &next_data_pnf, &next_hole_pfn))
 			goto err_xfer;
@@ -814,8 +833,21 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 			ret = page_pipe_add_hole(pp, pgaddr, PP_HOLE_PARENT);
 			st = 0;
 		} else {
-			ret = page_pipe_add_page(pp, pgaddr, 0);
-			st = 1;
+			allocated_page_is_zero = shmem_page_is_all_zero((void *)pgaddr);
+			/*
+			 * Do not create zero gaps in images that can later be used
+			 * as a parent for shmem dirty tracking.  A later dump may
+			 * emit an unchanged page as PE_PARENT, and the parent
+			 * pagemap checker requires an entry for that address.
+			 * Pre-dump enables opts.track_mem before dumping shmem.
+			 */
+			if (!xfer.parent && !opts.track_mem && allocated_page_is_zero) {
+				ret = 0;
+				skipped_allocated_zero_page = true;
+			} else {
+				ret = page_pipe_add_page(pp, pgaddr, 0);
+				st = 1;
+			}
 		}
 
 		if (ret == -EAGAIN) {
@@ -827,6 +859,15 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 		} else if (ret)
 			goto err_xfer;
 
+		if (pgstate == PST_ZERO)
+			sparse_zero_pages++;
+		else if (skipped_allocated_zero_page)
+			skipped_zero_pages++;
+		else if (st == 1 && allocated_page_is_zero)
+			written_zero_pages++;
+		else if (st == 1)
+			written_nonzero_pages++;
+
 		if (st >= 0)
 			pages[st]++;
 	}
@@ -836,6 +877,13 @@ static int do_dump_one_shmem(int fd, void *addr, struct shmem_info *si)
 	cnt_add(CNT_SHPAGES_WRITTEN, pages[1]);
 
 	ret = dump_pages(pp, &xfer);
+	if (!ret)
+		pr_info("Shmem zero skip summary shmid=%#lx size=%lu total_pages=%lu sparse_zero_pages=%lu skipped_zero_pages=%lu written_zero_pages=%lu written_nonzero_pages=%lu parent_pages=%lu written_pages=%lu skipped_zero_bytes=%llu written_zero_bytes=%llu written_nonzero_bytes=%llu\n",
+			si->shmid, si->size, nrpages, sparse_zero_pages, skipped_zero_pages,
+			written_zero_pages, written_nonzero_pages, pages[0], pages[1],
+			(unsigned long long)skipped_zero_pages * PAGE_SIZE,
+			(unsigned long long)written_zero_pages * PAGE_SIZE,
+			(unsigned long long)written_nonzero_pages * PAGE_SIZE);
 
 err_xfer:
 	xfer.close(&xfer);

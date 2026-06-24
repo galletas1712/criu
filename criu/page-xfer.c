@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <string.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-xfer: "
@@ -29,6 +30,8 @@
 #include "tls.h"
 
 static int page_server_sk = -1;
+
+#define ZERO_FILTER_BATCH_PAGES 1024
 
 struct page_server_iov {
 	u32 cmd;
@@ -484,6 +487,90 @@ static int dump_holes(struct page_xfer *xfer, struct page_pipe *pp, unsigned int
 	return 0;
 }
 
+static bool page_is_all_zero(const void *page)
+{
+	const unsigned char *p = page;
+	unsigned long i, size = PAGE_SIZE;
+
+	for (i = 0; i < size; i++)
+		if (p[i])
+			return false;
+
+	return true;
+}
+
+static int dump_zero_filtered_iov(struct page_xfer *xfer, struct page_pipe *pp, struct page_pipe_buf *ppb,
+				  struct iovec *iov, u32 flags, unsigned int *cur_hole,
+				  unsigned long *zero_pages, unsigned long *written_pages)
+{
+	unsigned long batch_len = ZERO_FILTER_BATCH_PAGES * PAGE_SIZE;
+	unsigned long done = 0;
+	unsigned long len = iov->iov_len;
+	void *buf;
+	int ret = 0;
+
+	buf = xmalloc(batch_len);
+	if (!buf)
+		return -1;
+
+	while (done < len) {
+		unsigned long chunk = min(len - done, batch_len);
+		unsigned long off = 0;
+
+		if (read_all(ppb->p[0], buf, chunk) != chunk) {
+			pr_perror("Unable to read pages for zero filtering");
+			ret = -1;
+			break;
+		}
+
+		while (off < chunk) {
+			unsigned long run_start, run_len;
+			struct iovec run_iov;
+
+			if (page_is_all_zero(buf + off)) {
+				(*zero_pages)++;
+				off += PAGE_SIZE;
+				continue;
+			}
+
+			run_start = off;
+			do {
+				off += PAGE_SIZE;
+			} while (off < chunk && !page_is_all_zero(buf + off));
+			run_len = off - run_start;
+
+			run_iov.iov_base = iov->iov_base + done + run_start;
+			run_iov.iov_len = run_len;
+
+			ret = dump_holes(xfer, pp, cur_hole, run_iov.iov_base);
+			if (ret)
+				break;
+
+			BUG_ON(run_iov.iov_base < (void *)xfer->offset);
+			run_iov.iov_base -= xfer->offset;
+			pr_debug("\tz %p - %p\n", run_iov.iov_base, run_iov.iov_base + run_iov.iov_len);
+
+			if (xfer->write_pagemap(xfer, &run_iov, flags)) {
+				ret = -1;
+				break;
+			}
+			if (write_all(img_raw_fd(xfer->pi), buf + run_start, run_len) != run_len) {
+				pr_perror("Unable to write filtered pages");
+				ret = -1;
+				break;
+			}
+			*written_pages += run_len / PAGE_SIZE;
+		}
+
+		if (ret)
+			break;
+		done += chunk;
+	}
+
+	xfree(buf);
+	return ret;
+}
+
 static inline u32 ppb_xfer_flags(struct page_xfer *xfer, struct page_pipe_buf *ppb)
 {
 	if (ppb->flags & PPB_LAZY)
@@ -881,6 +968,8 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
 	struct page_pipe_buf *ppb;
 	unsigned int cur_hole = 0;
+	unsigned long zero_pages = 0;
+	unsigned long zero_filtered_pages = 0;
 	int ret;
 
 	pr_debug("Transferring pages:\n");
@@ -894,6 +983,20 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 			struct iovec iov = ppb->iov[i];
 			u32 flags;
 
+			flags = ppb_xfer_flags(xfer, ppb);
+			/*
+			 * Zero filtering writes present page data directly to the
+			 * local pages.img, so keep this optimization disabled for
+			 * page-server transfers.
+			 */
+			if (!opts.use_page_server && (ppb->flags & PPB_ZERO_SKIP) && (flags & PE_PRESENT)) {
+				ret = dump_zero_filtered_iov(xfer, pp, ppb, &iov, flags, &cur_hole, &zero_pages,
+							     &zero_filtered_pages);
+				if (ret)
+					return ret;
+				continue;
+			}
+
 			ret = dump_holes(xfer, pp, &cur_hole, iov.iov_base);
 			if (ret)
 				return ret;
@@ -902,8 +1005,6 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 			iov.iov_base -= xfer->offset;
 			pr_debug("\tp %p - %p\n", iov.iov_base, iov.iov_base + iov.iov_len);
 
-			flags = ppb_xfer_flags(xfer, ppb);
-
 			if (xfer->write_pagemap(xfer, &iov, flags))
 				return -1;
 			if ((flags & PE_PRESENT) && xfer->write_pages(xfer, ppb->p[0], iov.iov_len))
@@ -911,7 +1012,14 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 		}
 	}
 
-	return dump_holes(xfer, pp, &cur_hole, NULL);
+	ret = dump_holes(xfer, pp, &cur_hole, NULL);
+	if (!ret && zero_pages) {
+		cnt_sub(CNT_PAGES_WRITTEN, zero_pages);
+		pr_info("Zero-page skip elided %lu anonymous pages, wrote %lu pages\n",
+			zero_pages, zero_filtered_pages);
+	}
+
+	return ret;
 }
 
 /*

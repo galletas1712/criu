@@ -222,7 +222,7 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
  */
 
 static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
-			 bool has_parent)
+			 bool has_parent, bool zero_skip)
 {
 	unsigned long nr_scanned;
 	unsigned long pages[3] = {};
@@ -249,6 +249,8 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 
 		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
 			ppb_flags |= PPB_LAZY;
+		if (zero_skip && vma_entry_is(vma->e, VMA_ANON_PRIVATE))
+			ppb_flags |= PPB_ZERO_SKIP;
 
 		/*
 		 * If we're doing incremental dump (parent images
@@ -509,7 +511,12 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 		return add_shmem_area(item->pid->real, vma->e, pmc);
 	vaddr = vma->e->start;
 again:
-	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent);
+	/*
+	 * Images created with --track-mem can become parents, so zero-skipping
+	 * must not create gaps that later PE_PARENT entries cannot resolve.
+	 */
+	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent,
+			    !has_parent && !pre_dump && !opts.track_mem);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 

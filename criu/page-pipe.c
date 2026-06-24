@@ -81,6 +81,8 @@ static struct page_pipe_buf *pp_prev_ppb(struct page_pipe *pp, unsigned int ppb_
 
 	if (ppb_flags & PPB_LAZY && opts.lazy_pages)
 		type = 1;
+	if (ppb_flags & PPB_ZERO_SKIP)
+		type |= 2;
 
 	return pp->prev[type];
 }
@@ -91,6 +93,8 @@ static void pp_update_prev_ppb(struct page_pipe *pp, struct page_pipe_buf *ppb, 
 
 	if (ppb_flags & PPB_LAZY && opts.lazy_pages)
 		type = 1;
+	if (ppb_flags & PPB_ZERO_SKIP)
+		type |= 2;
 
 	pp->prev[type] = ppb;
 }

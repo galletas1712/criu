@@ -1483,14 +1483,16 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		return -1;
 	}
 
-	pr->pidx = open_image_at(dfd, CR_FD_PAGE_INDEX, O_RSTR, pr->pages_img_id);
-	if (!pr->pidx) {
-		close_page_read(pr);
-		return -1;
-	}
-	if (empty_image(pr->pidx)) {
-		close_image(pr->pidx);
-		pr->pidx = NULL;
+	if (compact_pages_usable(dfd, pr->pages_img_id)) {
+		pr->pidx = open_image_at(dfd, CR_FD_PAGE_INDEX, O_RSTR, pr->pages_img_id);
+		if (!pr->pidx) {
+			close_page_read(pr);
+			return -1;
+		}
+		if (empty_image(pr->pidx)) {
+			close_image(pr->pidx);
+			pr->pidx = NULL;
+		}
 	}
 
 	if (!pr->pidx) {

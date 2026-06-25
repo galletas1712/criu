@@ -137,10 +137,17 @@ int dedup_one_iovec(struct page_read *pr, unsigned long off, unsigned long len)
 		if (!pr->pe)
 			return -1;
 		piov_end = pr->pe->vaddr + pagemap_len(pr->pe);
-		if (!pagemap_in_parent(pr->pe)) {
+		if (!pagemap_in_parent(pr->pe) && !pr->disable_dedup) {
 			ret = punch_hole(pr, pr->pi_off, min(piov_end, iov_end) - off, false);
 			if (ret == -1)
 				return ret;
+		} else if (!pagemap_in_parent(pr->pe)) {
+			/*
+			 * Compact page blobs are shared read-only restore inputs. Keep
+			 * traversing parents for validation, but never punch them.
+			 */
+			pr_debug("pr%lu-%u:Dedup disabled, skip punching %lx-%lx\n", pr->img_id, pr->id, off,
+				 min(piov_end, iov_end));
 		}
 
 		prp = pr->parent;

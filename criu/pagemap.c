@@ -6,6 +6,7 @@
 #include <string.h>
 #include <linux/falloc.h>
 #include <sys/uio.h>
+#include <limits.h>
 
 #include "types.h"
 #include "atomic.h"

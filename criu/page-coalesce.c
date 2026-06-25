@@ -33,8 +33,6 @@
 #define COALESCE_MAX_THREADS 32
 #define COALESCE_INITIAL_SLOTS (1 << 22)
 
-static const unsigned char zero_page[PAGE_SIZE] __attribute__((aligned(64)));
-
 struct page_hash_key {
 	u64 w0;
 	u64 w1;
@@ -211,7 +209,14 @@ static inline u64 page_hash_step(u64 state, u64 word, u64 addend, u64 multiplier
 
 static bool page_is_all_zero(const void *page)
 {
-	return memcmp(page, zero_page, PAGE_SIZE) == 0;
+	const unsigned char *p = page;
+	unsigned long i, size = PAGE_SIZE;
+
+	for (i = 0; i < size; i++)
+		if (p[i])
+			return false;
+
+	return true;
 }
 
 static void compute_page_hash_key(const void *page, struct page_hash_key *out, bool *zero)

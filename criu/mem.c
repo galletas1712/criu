@@ -1549,7 +1549,7 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 	 * the input files (in restorer.c). Compact page images are shared
 	 * read-only blobs and are never punched by the restore helpers.
 	 */
-	if (compact_pages_committed(get_service_fd(IMG_FD_OFF), rsti(t)->pages_img_id))
+	if (compact_pages_usable(get_service_fd(IMG_FD_OFF), rsti(t)->pages_img_id))
 		pages = open_image(CR_FD_PAGES_BLOB, O_RSTR);
 	else
 		pages = open_image(CR_FD_PAGES, opts.auto_dedup ? O_RDWR : O_RSTR, rsti(t)->pages_img_id);

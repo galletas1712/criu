@@ -8,7 +8,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/uio.h>
-#include <sys/time.h>
 #include <unistd.h>
 #include <stdlib.h>
 
@@ -64,8 +63,6 @@ struct page_store {
 	size_t used;
 	struct cr_img *blob;
 	u64 next_offset;
-	u64 grow_us;
-	u64 blob_write_us;
 };
 
 struct chunk_group_slot {
@@ -88,7 +85,6 @@ struct hash_batch {
 	pthread_mutex_t lock;
 	pthread_cond_t work_ready;
 	pthread_cond_t work_done;
-	u64 hash_us;
 };
 
 struct hash_worker {
@@ -121,7 +117,6 @@ struct blob_writer {
 	bool stop;
 	bool pending;
 	bool started;
-	u64 write_us;
 };
 
 struct coalesce_stats {
@@ -134,12 +129,6 @@ struct coalesce_stats {
 	u64 lookup_candidates;
 	u64 local_duplicate_pages;
 	u64 images;
-	u64 total_us;
-	u64 read_us;
-	u64 hash_us;
-	u64 lookup_us;
-	u64 blob_write_us;
-	u64 index_write_us;
 };
 
 struct coalesce_job {
@@ -177,14 +166,6 @@ static struct coalesce_worker_state online_state = {
 	.jobs = LIST_HEAD_INIT(online_state.jobs),
 	.compact.images = LIST_HEAD_INIT(online_state.compact.images),
 };
-
-static u64 now_us(void)
-{
-	struct timeval tv;
-
-	gettimeofday(&tv, NULL);
-	return (u64)tv.tv_sec * 1000000ULL + (u64)tv.tv_usec;
-}
 
 static inline u64 rotl64(u64 x, int r)
 {
@@ -289,7 +270,6 @@ static int page_store_resize(struct page_store *store, size_t new_cap)
 {
 	struct page_hash_slot *new_slots;
 	size_t i;
-	u64 start_us = now_us();
 
 	new_slots = xzalloc(new_cap * sizeof(*new_slots));
 	if (!new_slots)
@@ -313,7 +293,6 @@ static int page_store_resize(struct page_store *store, size_t new_cap)
 	store->slots = new_slots;
 	store->cap = new_cap;
 	store->grow_at = (new_cap * 7) / 10;
-	store->grow_us += now_us() - start_us;
 	return 0;
 }
 
@@ -405,10 +384,8 @@ static void *hash_worker_main(void *arg)
 	unsigned int worker_id = worker->worker_id;
 
 	for (;;) {
-		u64 local_hash_us = 0;
 		unsigned int start;
 		unsigned int end;
-		u64 start_us;
 
 		pthread_mutex_lock(&batch->lock);
 		while (!batch->stop && batch->generation == generation)
@@ -424,17 +401,14 @@ static void *hash_worker_main(void *arg)
 		end = batch->worker_end[worker_id];
 		pthread_mutex_unlock(&batch->lock);
 
-		start_us = now_us();
 		while (start < end) {
 			const char *page = batch->pages + start * PAGE_SIZE;
 
 			compute_page_hash_key(page, &batch->meta[start].key, &batch->meta[start].zero);
 			start++;
 		}
-		local_hash_us += now_us() - start_us;
 
 		pthread_mutex_lock(&batch->lock);
-		batch->hash_us += local_hash_us;
 		batch->done_workers++;
 		if (batch->done_workers == batch->nr_workers)
 			pthread_cond_signal(&batch->work_done);
@@ -516,27 +490,23 @@ static void hash_pool_fini(struct hash_pool *pool)
 	memzero(pool, sizeof(*pool));
 }
 
-static void hash_pages_serial(const char *pages, struct page_batch_meta *meta, unsigned int nr_pages, u64 *hash_us)
+static void hash_pages_serial(const char *pages, struct page_batch_meta *meta, unsigned int nr_pages)
 {
 	unsigned int i;
-	u64 start_us = now_us();
 
 	for (i = 0; i < nr_pages; i++) {
 		const char *page = pages + i * PAGE_SIZE;
 
 		compute_page_hash_key(page, &meta[i].key, &meta[i].zero);
 	}
-
-	*hash_us += now_us() - start_us;
 }
 
-static int hash_pool_run(struct hash_pool *pool, const char *pages, struct page_batch_meta *meta, unsigned int nr_pages,
-			 u64 *hash_us)
+static int hash_pool_run(struct hash_pool *pool, const char *pages, struct page_batch_meta *meta, unsigned int nr_pages)
 {
 	unsigned int i;
 
 	if (!pool->threads || nr_pages < COALESCE_HASH_MIN_LOAD * COALESCE_WORK_PAGES) {
-		hash_pages_serial(pages, meta, nr_pages, hash_us);
+		hash_pages_serial(pages, meta, nr_pages);
 		return 0;
 	}
 
@@ -545,7 +515,6 @@ static int hash_pool_run(struct hash_pool *pool, const char *pages, struct page_
 	pool->batch.meta = meta;
 	pool->batch.nr_pages = nr_pages;
 	pool->batch.done_workers = 0;
-	pool->batch.hash_us = 0;
 	for (i = 0; i < pool->nr_threads; i++) {
 		unsigned int base = nr_pages / pool->nr_threads;
 		unsigned int extra = nr_pages % pool->nr_threads;
@@ -559,7 +528,6 @@ static int hash_pool_run(struct hash_pool *pool, const char *pages, struct page_
 	pthread_cond_broadcast(&pool->batch.work_ready);
 	while (pool->batch.done_workers != pool->batch.nr_workers)
 		pthread_cond_wait(&pool->batch.work_done, &pool->batch.lock);
-	*hash_us += pool->batch.hash_us;
 	pthread_mutex_unlock(&pool->batch.lock);
 	return 0;
 }
@@ -652,7 +620,6 @@ static void *blob_writer_main(void *arg)
 
 	pthread_mutex_lock(&writer->lock);
 	for (;;) {
-		u64 local_write_us = 0;
 		unsigned int i;
 		int status = 0;
 
@@ -665,7 +632,6 @@ static void *blob_writer_main(void *arg)
 		}
 
 		pthread_mutex_unlock(&writer->lock);
-		local_write_us = now_us();
 		for (i = 0; i < writer->nr_iovecs;) {
 			unsigned int batch_iov = writer->nr_iovecs - i;
 			int written;
@@ -687,10 +653,8 @@ static void *blob_writer_main(void *arg)
 			}
 			i += batch_iov;
 		}
-		local_write_us = now_us() - local_write_us;
 
 		pthread_mutex_lock(&writer->lock);
-		writer->write_us += local_write_us;
 		writer->status = status;
 		writer->pending = false;
 		writer->nr_iovecs = 0;
@@ -924,19 +888,11 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	unsigned int pending_offsets = 0;
 	unsigned int pending_chunk_pages = 0;
 	bool have_pending_index = false;
-	u64 step_start_us = 0;
-	u64 image_start_us = 0;
 	u64 image_present_pages = 0;
 	u64 image_zero_pages = 0;
 	u64 image_unique_pages = 0;
 	u64 image_lookup_candidates = 0;
 	u64 image_local_duplicate_pages = 0;
-	u64 image_total_us = 0;
-	u64 image_read_us = 0;
-	u64 image_hash_us = 0;
-	u64 image_lookup_us = 0;
-	u64 image_blob_write_us = 0;
-	u64 image_index_write_us = 0;
 	u32 chunk_group_generation = 1;
 	int ret = -1;
 
@@ -1003,7 +959,6 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	}
 
 	if (old_pages_size > 0) {
-		step_start_us = now_us();
 		old_pages_map = mmap(NULL, (size_t)old_pages_size, PROT_READ, MAP_PRIVATE, old_pages_fd, 0);
 		if (old_pages_map == MAP_FAILED) {
 			pr_perror("Can't mmap pages image for id %u", pages_id);
@@ -1013,7 +968,6 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		old_pages_mapped = true;
 		(void)posix_fadvise(old_pages_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 		(void)madvise((void *)old_pages_map, (size_t)old_pages_size, MADV_SEQUENTIAL);
-		image_read_us += now_us() - step_start_us;
 	}
 
 	index = open_image_at(dfd, CR_FD_PAGE_INDEX, O_DUMP, pages_id);
@@ -1024,19 +978,17 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	if (blob_writer_init(&writer, store->blob))
 		goto out;
 
-	image_start_us = now_us();
 	for (size_t chunk_idx = 0; chunk_idx < schedule.nr_chunks; chunk_idx++) {
 		unsigned int chunk_pages = schedule.pages[chunk_idx];
 		size_t chunk_bytes = (size_t)chunk_pages * PAGE_SIZE;
 		const char *chunk_pages_ptr = old_pages_map + source_off;
 		u64 *offsets = offset_buffers[current_offsets];
-		u64 lookup_start_us;
 		unsigned int j;
 		unsigned int nr_blob_pages = 0;
 		unsigned int group_count = 0;
 		unsigned int chunk_nonzero_pages = 0;
 
-		if (hash_pool_run(pool, chunk_pages_ptr, meta, chunk_pages, &image_hash_us))
+		if (hash_pool_run(pool, chunk_pages_ptr, meta, chunk_pages))
 			goto out;
 
 		if (!chunk_group_generation) {
@@ -1064,7 +1016,6 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 				chunk_rep_page[group_count++] = j;
 		}
 
-		lookup_start_us = now_us();
 		for (j = 0; j < group_count; j++) {
 			unsigned int rep = chunk_rep_page[j];
 			bool is_new;
@@ -1079,7 +1030,6 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 				image_unique_pages++;
 			}
 		}
-		image_lookup_us += now_us() - lookup_start_us;
 		image_lookup_candidates += group_count;
 		image_local_duplicate_pages += chunk_nonzero_pages - group_count;
 
@@ -1103,10 +1053,8 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		}
 
 		if (have_pending_index) {
-			step_start_us = now_us();
 			if (write_img_buf(index, offset_buffers[pending_offsets], pending_chunk_pages * sizeof(*offsets)))
 				goto out;
-			image_index_write_us += now_us() - step_start_us;
 			have_pending_index = false;
 		}
 
@@ -1132,15 +1080,9 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	if (blob_writer_wait(&writer))
 		goto out;
 	if (have_pending_index) {
-		step_start_us = now_us();
 		if (write_img_buf(index, offset_buffers[pending_offsets], pending_chunk_pages * sizeof(*offset_buffers[pending_offsets])))
 			goto out;
-		image_index_write_us += now_us() - step_start_us;
 	}
-
-	store->blob_write_us += writer.write_us;
-	image_blob_write_us = writer.write_us;
-	image_total_us = now_us() - image_start_us;
 
 	stats->old_bytes += old_pages_size;
 	stats->index_bytes += image_present_pages * sizeof(*offset_buffers[0]);
@@ -1150,20 +1092,11 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	stats->lookup_candidates += image_lookup_candidates;
 	stats->local_duplicate_pages += image_local_duplicate_pages;
 	stats->images++;
-	stats->total_us += image_total_us;
-	stats->read_us += image_read_us;
-	stats->hash_us += image_hash_us;
-	stats->lookup_us += image_lookup_us;
-	stats->blob_write_us = store->blob_write_us;
-	stats->index_write_us += image_index_write_us;
 
-	pr_info("Image %u coalesced: present=%llu unique=%llu local_unique=%llu local_dup=%llu zero=%llu total=%llu ms read=%llu ms hash=%llu ms lookup=%llu ms blob=%llu ms index=%llu ms\n",
+	pr_info("Image %u coalesced: present=%llu unique=%llu local_unique=%llu local_dup=%llu zero=%llu\n",
 		pages_id, (unsigned long long)image_present_pages, (unsigned long long)image_unique_pages,
 		(unsigned long long)image_lookup_candidates, (unsigned long long)image_local_duplicate_pages,
-		(unsigned long long)image_zero_pages, (unsigned long long)(image_total_us / 1000ULL),
-		(unsigned long long)(image_read_us / 1000ULL), (unsigned long long)(image_hash_us / 1000ULL),
-		(unsigned long long)(image_lookup_us / 1000ULL), (unsigned long long)(image_blob_write_us / 1000ULL),
-		(unsigned long long)(image_index_write_us / 1000ULL));
+		(unsigned long long)image_zero_pages);
 
 	if (compact_image_set_add(compact, pages_id))
 		goto out;
@@ -1393,9 +1326,6 @@ static int coalesce_checkpoint_pages_finish_online(void)
 		ret = -1;
 
 	if (!ret) {
-		online_state.stats.total_us = online_state.stats.read_us + online_state.stats.hash_us + online_state.stats.lookup_us +
-					      online_state.store.blob_write_us + online_state.stats.index_write_us;
-		online_state.stats.blob_write_us = online_state.store.blob_write_us;
 		online_state.stats.blob_bytes = online_state.store.next_offset;
 
 		pr_info("Coalesced %llu present pages across %llu pagemap images into %llu unique non-zero pages, eliding %llu zero pages\n",
@@ -1410,17 +1340,6 @@ static int coalesce_checkpoint_pages_finish_online(void)
 			(unsigned long long)(online_state.stats.blob_bytes + online_state.stats.index_bytes),
 			(long long)(online_state.stats.old_bytes -
 				   (online_state.stats.blob_bytes + online_state.stats.index_bytes)));
-		pr_info("Coalesce timings: total=%llu ms read=%llu ms hash=%llu ms lookup=%llu ms blob=%llu ms index=%llu ms grow=%llu ms table_used=%zu table_cap=%zu table_load=%llu%% workers=%u batch_pages=%u mode=online\n",
-			(unsigned long long)(online_state.stats.total_us / 1000ULL),
-			(unsigned long long)(online_state.stats.read_us / 1000ULL),
-			(unsigned long long)(online_state.stats.hash_us / 1000ULL),
-			(unsigned long long)(online_state.stats.lookup_us / 1000ULL),
-			(unsigned long long)(online_state.stats.blob_write_us / 1000ULL),
-			(unsigned long long)(online_state.stats.index_write_us / 1000ULL),
-			(unsigned long long)(online_state.store.grow_us / 1000ULL), online_state.store.used,
-			online_state.store.cap,
-			(unsigned long long)(online_state.store.cap ? (online_state.store.used * 100ULL / online_state.store.cap) : 0),
-			online_state.pool.nr_threads, COALESCE_BATCH_PAGES);
 	}
 	if (ret)
 		cleanup_compact_sidecars(online_state.dfd, &online_state.compact);
@@ -1440,7 +1359,6 @@ static int coalesce_checkpoint_pages_postpass(void)
 	size_t nr_targets = 0;
 	int dfd;
 	int ret = 0;
-	u64 start_us;
 
 	if (!should_run_page_coalesce())
 		return 0;
@@ -1480,15 +1398,12 @@ static int coalesce_checkpoint_pages_postpass(void)
 		return -1;
 	}
 
-	start_us = now_us();
 	for (i = 0; i < nr_targets; i++) {
 		if (coalesce_one_pagemap(dfd, &pool, &store, &compact, &targets[i], &stats)) {
 			ret = -1;
 			break;
 		}
 	}
-	stats.total_us = now_us() - start_us;
-	stats.blob_write_us = store.blob_write_us;
 	stats.blob_bytes = store.next_offset;
 
 	close_image(store.blob);
@@ -1514,12 +1429,6 @@ static int coalesce_checkpoint_pages_postpass(void)
 		(unsigned long long)stats.index_bytes,
 		(unsigned long long)(stats.blob_bytes + stats.index_bytes),
 		(long long)(stats.old_bytes - (stats.blob_bytes + stats.index_bytes)));
-	pr_info("Coalesce timings: total=%llu ms read=%llu ms hash=%llu ms lookup=%llu ms blob=%llu ms index=%llu ms grow=%llu ms table_used=%zu table_cap=%zu table_load=%llu%% workers=%u batch_pages=%u\n",
-		(unsigned long long)(stats.total_us / 1000ULL), (unsigned long long)(stats.read_us / 1000ULL),
-		(unsigned long long)(stats.hash_us / 1000ULL), (unsigned long long)(stats.lookup_us / 1000ULL),
-		(unsigned long long)(stats.blob_write_us / 1000ULL), (unsigned long long)(stats.index_write_us / 1000ULL),
-		(unsigned long long)(store.grow_us / 1000ULL), store.used, store.cap,
-		(unsigned long long)(store.cap ? (store.used * 100ULL / store.cap) : 0), pool.nr_threads, COALESCE_BATCH_PAGES);
 	return 0;
 }
 

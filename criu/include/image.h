@@ -184,7 +184,6 @@ extern int clear_compact_pages_commit(int dfd);
 extern int mark_compact_pages_commit(int dfd);
 extern struct cr_img *open_pages_image(unsigned long flags, struct cr_img *pmi, u32 *pages_id);
 extern struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *pages_id);
-extern struct cr_img *open_raw_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *pages_id);
 extern void up_page_ids_base(void);
 
 extern struct cr_img *img_from_fd(int fd); /* for cr-show mostly */

@@ -917,14 +917,6 @@ static int open_pages_image_id(unsigned long flags, struct cr_img *pmi, u32 *id)
 	return 0;
 }
 
-struct cr_img *open_raw_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
-{
-	if (open_pages_image_id(flags, pmi, id))
-		return NULL;
-
-	return open_image_at(dfd, CR_FD_PAGES, flags, *id);
-}
-
 struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
 {
 	if (open_pages_image_id(flags, pmi, id))

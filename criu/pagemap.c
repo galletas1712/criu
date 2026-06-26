@@ -396,10 +396,12 @@ static int read_indexed_pages(struct page_read *pr, off_t logical_off, unsigned 
 		for (unsigned long chunk_start = 0; chunk_start < run_pages; chunk_start += (unsigned long)IOV_MAX) {
 			struct iovec run_iov_stack[64];
 			struct iovec *run_iov = run_iov_stack;
+			struct iovec *run_iov_alloc = NULL;
 			unsigned int run_iov_n = run_pages - chunk_start;
 			unsigned int j;
-			ssize_t read_ret;
-			unsigned long chunk_off = (off_t)groups[run_start + chunk_start].off;
+			size_t remaining;
+			off_t chunk_off = (off_t)groups[run_start + chunk_start].off;
+			off_t read_off = chunk_off;
 
 			if (run_iov_n > IOV_MAX)
 				run_iov_n = IOV_MAX;
@@ -409,6 +411,7 @@ static int read_indexed_pages(struct page_read *pr, off_t logical_off, unsigned 
 					ret = -1;
 					goto out;
 				}
+				run_iov_alloc = run_iov;
 			}
 
 			for (j = 0; j < run_iov_n; j++) {
@@ -416,21 +419,40 @@ static int read_indexed_pages(struct page_read *pr, off_t logical_off, unsigned 
 				run_iov[j].iov_len = PAGE_SIZE;
 			}
 
-			read_ret = preadv(fd, run_iov, run_iov_n, chunk_off);
-			if (read_ret < 0 || (unsigned long)read_ret != run_iov_n * PAGE_SIZE) {
-				if (read_ret < 0)
+			remaining = (size_t)run_iov_n * PAGE_SIZE;
+			while (remaining) {
+				ssize_t read_ret = preadv(fd, run_iov, run_iov_n, read_off);
+
+				if (read_ret < 0) {
 					pr_perror("Can't read compacted page run");
-				else
-					pr_err("Short read from compacted page run: %zd/%u pages at off %llu\n",
-					       read_ret, run_iov_n, (unsigned long long)chunk_off);
-				if (run_iov != run_iov_stack)
-					xfree(run_iov);
-				ret = -1;
+					ret = -1;
+					break;
+				}
+				if (read_ret == 0) {
+					pr_err("Unexpected EOF reading compacted page run: %zu bytes remaining at off %llu\n",
+					       remaining, (unsigned long long)read_off);
+					ret = -1;
+					break;
+				}
+
+				read_off += read_ret;
+				remaining -= read_ret;
+				while (run_iov_n && (size_t)read_ret >= run_iov->iov_len) {
+					read_ret -= run_iov->iov_len;
+					run_iov++;
+					run_iov_n--;
+				}
+				if (read_ret) {
+					run_iov->iov_base += read_ret;
+					run_iov->iov_len -= read_ret;
+				}
+			}
+			if (ret) {
+				xfree(run_iov_alloc);
 				goto out;
 			}
 
-			if (run_iov != run_iov_stack)
-				xfree(run_iov);
+			xfree(run_iov_alloc);
 		}
 
 		for (unsigned long j = 0; j < run_pages; j++) {

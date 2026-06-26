@@ -634,6 +634,18 @@ out:
 	return ret;
 }
 
+static int read_pagemap_pages_id(struct cr_img *pagemap, u32 *pages_id)
+{
+	PagemapHead *h;
+
+	if (pb_read_one(pagemap, &h, PB_PAGEMAP_HEAD) < 0)
+		return -1;
+
+	*pages_id = h->pages_id;
+	pagemap_head__free_unpacked(h, NULL);
+	return 0;
+}
+
 static void *blob_writer_main(void *arg)
 {
 	struct blob_writer *writer = arg;
@@ -901,10 +913,10 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 	struct chunk_schedule schedule = {};
 	struct blob_writer writer = {};
 	u32 pages_id = 0;
-	off_t old_pages_size;
+	off_t old_pages_size = 0;
 	off_t source_off = 0;
 	u64 expected_old_pages_size = 0;
-	int old_pages_fd;
+	int old_pages_fd = -1;
 	const char *old_pages_map = NULL;
 	bool old_pages_mapped = false;
 	size_t chunk_groups_cap;
@@ -947,24 +959,7 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		goto out;
 	}
 
-	old_pages = open_raw_pages_image_at(dfd, O_RSTR, pagemap, &pages_id);
-	if (!old_pages || empty_image(old_pages)) {
-		if (compact_pages_committed(dfd, pages_id)) {
-			ret = 0;
-			goto out;
-		}
-		pr_err("Missing pages image for id %u\n", pages_id);
-		goto out;
-	}
-
-	index = open_image_at(dfd, CR_FD_PAGE_INDEX, O_DUMP, pages_id);
-	if (!index)
-		goto out;
-	snprintf(index_path, sizeof(index_path), imgset_template[CR_FD_PAGE_INDEX].fmt, pages_id);
-
-	old_pages_fd = img_raw_fd(old_pages);
-	old_pages_size = img_raw_size(old_pages);
-	if (old_pages_fd < 0 || old_pages_size < 0)
+	if (read_pagemap_pages_id(pagemap, &pages_id))
 		goto out;
 
 	if (build_chunk_schedule(pagemap, &schedule))
@@ -980,10 +975,31 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		expected_old_pages_size += chunk_bytes;
 	}
 
-	if (expected_old_pages_size != (u64)old_pages_size) {
-		pr_err("Pages image size mismatch for id %u: pagemap consumes %llu bytes, file has %jd bytes\n",
-		       pages_id, (unsigned long long)expected_old_pages_size, (intmax_t)old_pages_size);
+	old_pages = open_image_at(dfd, CR_FD_PAGES, O_RSTR, pages_id);
+	if (!old_pages)
 		goto out;
+
+	if (empty_image(old_pages)) {
+		if (expected_old_pages_size) {
+			pr_err("Missing pages image for id %u: pagemap consumes %llu bytes\n", pages_id,
+			       (unsigned long long)expected_old_pages_size);
+			goto out;
+		}
+		if (compact_pages_committed(dfd, pages_id)) {
+			ret = 0;
+			goto out;
+		}
+	} else {
+		old_pages_fd = img_raw_fd(old_pages);
+		old_pages_size = img_raw_size(old_pages);
+		if (old_pages_fd < 0 || old_pages_size < 0)
+			goto out;
+
+		if (expected_old_pages_size != (u64)old_pages_size) {
+			pr_err("Pages image size mismatch for id %u: pagemap consumes %llu bytes, file has %jd bytes\n",
+			       pages_id, (unsigned long long)expected_old_pages_size, (intmax_t)old_pages_size);
+			goto out;
+		}
 	}
 
 	if (old_pages_size > 0) {
@@ -999,6 +1015,11 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		(void)madvise((void *)old_pages_map, (size_t)old_pages_size, MADV_SEQUENTIAL);
 		image_read_us += now_us() - step_start_us;
 	}
+
+	index = open_image_at(dfd, CR_FD_PAGE_INDEX, O_DUMP, pages_id);
+	if (!index)
+		goto out;
+	snprintf(index_path, sizeof(index_path), imgset_template[CR_FD_PAGE_INDEX].fmt, pages_id);
 
 	if (blob_writer_init(&writer, store->blob))
 		goto out;

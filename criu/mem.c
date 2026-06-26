@@ -1165,6 +1165,7 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 
 	vma = list_first_entry(vmas, struct vma_area, list);
 	rsti(t)->pages_img_id = pr->pages_img_id;
+	rsti(t)->pages_img_compact = pr->pages_img_compact;
 
 	/* O_DIRECT may require the buffer to be aligned. */
 	memerr = posix_memalign(&buf, PAGE_SIZE, PAGE_SIZE);
@@ -1549,12 +1550,16 @@ static int prepare_vma_ios(struct pstree_item *t, struct task_restore_args *ta)
 	 * the input files (in restorer.c). Compact page images are shared
 	 * read-only blobs and are never punched by the restore helpers.
 	 */
-	if (compact_pages_usable(get_service_fd(IMG_FD_OFF), rsti(t)->pages_img_id))
+	if (rsti(t)->pages_img_compact)
 		pages = open_image(CR_FD_PAGES_BLOB, O_RSTR);
 	else
 		pages = open_image(CR_FD_PAGES, opts.auto_dedup ? O_RDWR : O_RSTR, rsti(t)->pages_img_id);
 	if (!pages)
 		return -1;
+	if (empty_image(pages)) {
+		close_image(pages);
+		return -1;
+	}
 
 	ta->vma_ios_fd = img_raw_fd(pages);
 	if (ta->vma_ios_fd >= 0) {

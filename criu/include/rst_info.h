@@ -56,6 +56,7 @@ struct rst_info {
 	MmEntry *mm;
 	struct list_head vma_io;
 	unsigned int pages_img_id;
+	bool pages_img_compact;
 
 	u32 cg_set;
 

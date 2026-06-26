@@ -835,27 +835,13 @@ static int unlink_image_file(int dfd, int type, u32 pages_id)
 	return -1;
 }
 
-static void cleanup_compact_sidecars(int dfd, struct compact_image_set *set)
+static int remove_raw_pages_images(int dfd, struct compact_image_set *set)
 {
 	struct compact_image *image;
 
-	(void)clear_compact_pages_commit(dfd);
-	(void)unlinkat(dfd, imgset_template[CR_FD_PAGES_BLOB].fmt, 0);
 	list_for_each_entry(image, &set->images, list)
-		(void)unlink_image_file(dfd, CR_FD_PAGE_INDEX, image->pages_id);
-}
-
-static int publish_compact_sidecars(int dfd, struct compact_image_set *set)
-{
-	struct compact_image *image;
-
-	if (mark_compact_pages_commit(dfd))
-		return -1;
-
-	list_for_each_entry(image, &set->images, list) {
 		if (unlink_image_file(dfd, CR_FD_PAGES, image->pages_id))
-			pr_warn("Keeping raw pages-%u.img after compact commit\n", image->pages_id);
-	}
+			return -1;
 
 	return 0;
 }
@@ -939,10 +925,6 @@ static int coalesce_one_pagemap(int dfd, struct hash_pool *pool, struct page_sto
 		if (expected_old_pages_size) {
 			pr_err("Missing pages image for id %u: pagemap consumes %llu bytes\n", pages_id,
 			       (unsigned long long)expected_old_pages_size);
-			goto out;
-		}
-		if (compact_pages_committed(dfd, pages_id)) {
-			ret = 0;
 			goto out;
 		}
 	} else {
@@ -1156,11 +1138,6 @@ static int coalesce_worker_init(struct coalesce_worker_state *state)
 	if (hash_pool_init(&state->pool))
 		return -1;
 
-	if (clear_compact_pages_commit(state->dfd)) {
-		hash_pool_fini(&state->pool);
-		return -1;
-	}
-
 	state->store.blob = open_image_at(state->dfd, CR_FD_PAGES_BLOB, O_RDWR | O_CREAT | O_TRUNC);
 	if (!state->store.blob) {
 		hash_pool_fini(&state->pool);
@@ -1306,7 +1283,6 @@ void coalesce_checkpoint_pages_abort(void)
 	pthread_mutex_unlock(&online_state.lock);
 
 	pthread_join(online_state.thread, NULL);
-	cleanup_compact_sidecars(online_state.dfd, &online_state.compact);
 	coalesce_worker_destroy(&online_state);
 }
 
@@ -1322,7 +1298,7 @@ static int coalesce_checkpoint_pages_finish_online(void)
 	pthread_join(online_state.thread, NULL);
 	if (online_state.failed)
 		ret = -1;
-	else if (publish_compact_sidecars(online_state.dfd, &online_state.compact))
+	else if (remove_raw_pages_images(online_state.dfd, &online_state.compact))
 		ret = -1;
 
 	if (!ret) {
@@ -1341,9 +1317,6 @@ static int coalesce_checkpoint_pages_finish_online(void)
 			(long long)(online_state.stats.old_bytes -
 				   (online_state.stats.blob_bytes + online_state.stats.index_bytes)));
 	}
-	if (ret)
-		cleanup_compact_sidecars(online_state.dfd, &online_state.compact);
-
 	coalesce_worker_destroy(&online_state);
 	return ret;
 }
@@ -1383,13 +1356,6 @@ static int coalesce_checkpoint_pages_postpass(void)
 		return -1;
 	}
 
-	if (clear_compact_pages_commit(dfd)) {
-		hash_pool_fini(&pool);
-		xfree(targets);
-		compact_image_set_fini(&compact);
-		return -1;
-	}
-
 	store.blob = open_image_at(dfd, CR_FD_PAGES_BLOB, O_RDWR | O_CREAT | O_TRUNC);
 	if (!store.blob) {
 		hash_pool_fini(&pool);
@@ -1411,10 +1377,8 @@ static int coalesce_checkpoint_pages_postpass(void)
 	page_store_fini(&store);
 	xfree(targets);
 
-	if (!ret && publish_compact_sidecars(dfd, &compact))
+	if (!ret && remove_raw_pages_images(dfd, &compact))
 		ret = -1;
-	if (ret)
-		cleanup_compact_sidecars(dfd, &compact);
 	compact_image_set_fini(&compact);
 	if (ret)
 		return ret;

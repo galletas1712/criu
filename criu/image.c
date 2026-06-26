@@ -20,8 +20,6 @@
 #include "img-streamer.h"
 #include "namespaces.h"
 
-#define COMPACT_PAGES_COMMIT_FILE "pages-dedup.ready"
-
 bool ns_per_id = false;
 bool img_common_magic = true;
 TaskKobjIdsEntry *root_ids;
@@ -806,94 +804,47 @@ void up_page_ids_base(void)
 	page_ids += 0x10000;
 }
 
-static bool page_index_exists(int dfd, u32 pages_id)
+static int image_file_exists(int dfd, int type, ...)
 {
-	bool exists;
-	struct cr_img *index = open_image_at(dfd, CR_FD_PAGE_INDEX, O_RSTR, pages_id);
-
-	if (!index)
-		return false;
-
-	exists = !empty_image(index);
-	close_image(index);
-	return exists;
-}
-
-static bool raw_pages_exist(int dfd, u32 pages_id)
-{
-	bool exists;
-	struct cr_img *pages = open_image_at(dfd, CR_FD_PAGES, O_RSTR, pages_id);
-
-	if (!pages)
-		return false;
-
-	exists = !empty_image(pages);
-	close_image(pages);
-	return exists;
-}
-
-static bool pages_blob_exists(int dfd)
-{
-	bool exists;
-	struct cr_img *blob = open_image_at(dfd, CR_FD_PAGES_BLOB, O_RSTR);
-
-	if (!blob)
-		return false;
-
-	exists = !empty_image(blob);
-	close_image(blob);
-	return exists;
-}
-
-bool compact_pages_committed(int dfd, u32 pages_id)
-{
+	char path[PATH_MAX];
 	struct stat st;
+	va_list args;
 
-	if (fstatat(dfd, COMPACT_PAGES_COMMIT_FILE, &st, 0)) {
-		if (errno != ENOENT)
-			pr_perror("Can't stat compact pages commit marker");
-		return false;
+	va_start(args, type);
+	vsnprintf(path, sizeof(path), imgset_template[type].fmt, args);
+	va_end(args);
+
+	if (!fstatat(dfd, path, &st, 0))
+		return 1;
+	if (errno != ENOENT) {
+		pr_perror("Can't stat image file %s", path);
+		return -1;
 	}
 
-	return page_index_exists(dfd, pages_id) && pages_blob_exists(dfd);
+	return 0;
 }
 
-bool compact_pages_usable(int dfd, u32 pages_id)
+static int select_pages_image_format(int dfd, u32 pages_id, bool *compact)
 {
-	return compact_pages_committed(dfd, pages_id) && !raw_pages_exist(dfd, pages_id);
-}
+	int index = image_file_exists(dfd, CR_FD_PAGE_INDEX, pages_id);
+	int blob;
 
-int clear_compact_pages_commit(int dfd)
-{
-	if (!unlinkat(dfd, COMPACT_PAGES_COMMIT_FILE, 0))
+	if (index < 0)
+		return -1;
+	if (!index) {
+		*compact = false;
 		return 0;
-	if (errno == ENOENT)
-		return 0;
+	}
 
-	pr_perror("Can't remove compact pages commit marker");
-	return -1;
-}
-
-int mark_compact_pages_commit(int dfd)
-{
-	int fd = openat(dfd, COMPACT_PAGES_COMMIT_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-
-	if (fd < 0) {
-		pr_perror("Can't create compact pages commit marker");
+	blob = image_file_exists(dfd, CR_FD_PAGES_BLOB);
+	if (blob < 0)
+		return -1;
+	if (!blob) {
+		pr_err("Incomplete compact pages image for pages id %u\n", pages_id);
 		return -1;
 	}
 
-	if (write(fd, "1\n", 2) != 2) {
-		pr_perror("Can't write compact pages commit marker");
-		close(fd);
-		return -1;
-	}
-
-	if (close(fd)) {
-		pr_perror("Can't close compact pages commit marker");
-		return -1;
-	}
-
+	*compact = true;
 	return 0;
 }
 
@@ -917,12 +868,18 @@ static int open_pages_image_id(unsigned long flags, struct cr_img *pmi, u32 *id)
 	return 0;
 }
 
-struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id)
+struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *pmi, u32 *id, bool *compact)
 {
+	bool use_compact = false;
+
 	if (open_pages_image_id(flags, pmi, id))
 		return NULL;
 
-	if ((flags == O_RDONLY || flags == O_RDWR) && compact_pages_usable(dfd, *id))
+	if ((flags == O_RDONLY || flags == O_RDWR) && select_pages_image_format(dfd, *id, &use_compact))
+		return NULL;
+	if (compact)
+		*compact = use_compact;
+	if (use_compact)
 		return open_image_at(dfd, CR_FD_PAGES_BLOB, O_RSTR);
 
 	return open_image_at(dfd, CR_FD_PAGES, flags, *id);
@@ -930,7 +887,7 @@ struct cr_img *open_pages_image_at(int dfd, unsigned long flags, struct cr_img *
 
 struct cr_img *open_pages_image(unsigned long flags, struct cr_img *pmi, u32 *id)
 {
-	return open_pages_image_at(get_service_fd(IMG_FD_OFF), flags, pmi, id);
+	return open_pages_image_at(get_service_fd(IMG_FD_OFF), flags, pmi, id, NULL);
 }
 
 /*

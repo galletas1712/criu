@@ -1454,6 +1454,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	/* Shared across asyncd fill-daemon workers, which open page-reads concurrently. */
 	static atomic_t ids = { 0 };
 	bool remote = pr_flags & PR_REMOTE;
+	bool compact = false;
 
 	/*
 	 * Only the top-most page-read can be remote, all the
@@ -1488,6 +1489,7 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 	pr->bunch.iov_base = NULL;
 	pr->pmes = NULL;
 	pr->pidx = NULL;
+	pr->pages_img_compact = false;
 	pr->pieok = false;
 	pr->disable_dedup = false;
 	pr->use_direct = false;
@@ -1506,21 +1508,22 @@ int open_page_read_at(int dfd, unsigned long img_id, struct page_read *pr, int p
 		return -1;
 	}
 
-	pr->pi = open_pages_image_at(dfd, flags, pr->pmi, &pr->pages_img_id);
+	pr->pi = open_pages_image_at(dfd, flags, pr->pmi, &pr->pages_img_id, &compact);
 	if (!pr->pi || empty_image(pr->pi)) {
 		close_page_read(pr);
 		return -1;
 	}
+	pr->pages_img_compact = compact;
 
-	if (compact_pages_usable(dfd, pr->pages_img_id)) {
+	if (compact) {
 		pr->pidx = open_image_at(dfd, CR_FD_PAGE_INDEX, O_RSTR, pr->pages_img_id);
 		if (!pr->pidx) {
 			close_page_read(pr);
 			return -1;
 		}
 		if (empty_image(pr->pidx)) {
-			close_image(pr->pidx);
-			pr->pidx = NULL;
+			close_page_read(pr);
+			return -1;
 		}
 	}
 

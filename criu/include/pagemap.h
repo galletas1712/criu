@@ -71,6 +71,7 @@ struct page_read {
 	struct cr_img *pi;
 	struct cr_img *pidx;
 	u32 pages_img_id;
+	bool pages_img_compact;
 
 	PagemapEntry *pe;	  /* current pagemap we are on */
 	struct page_read *parent; /* parent pagemap (if ->in_parent pagemap is met in image,

@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 
 #undef LOG_PREFIX
 #define LOG_PREFIX "page-xfer: "
@@ -29,6 +30,15 @@
 #include "tls.h"
 
 static int page_server_sk = -1;
+
+#define CUDA_STAGING_FILTER_BATCH_PAGES 1024
+
+static struct {
+	u64 pages_scanned;
+	u64 zero_pages;
+	u64 nonzero_pages;
+	u64 duration_us;
+} cuda_staging_zero_stats;
 
 struct page_server_iov {
 	u32 cmd;
@@ -484,6 +494,120 @@ static int dump_holes(struct page_xfer *xfer, struct page_pipe *pp, unsigned int
 	return 0;
 }
 
+static bool page_is_all_zero(const void *page)
+{
+	const unsigned char *p = page;
+	unsigned long i;
+
+	for (i = 0; i < PAGE_SIZE; i++)
+		if (p[i])
+			return false;
+
+	return true;
+}
+
+static int dump_cuda_staging_filtered_iov(struct page_xfer *xfer,
+					  struct page_pipe *pp,
+					  struct page_pipe_buf *ppb,
+					  struct iovec *iov, u32 flags,
+					  unsigned int *cur_hole)
+{
+	unsigned long batch_len = CUDA_STAGING_FILTER_BATCH_PAGES * PAGE_SIZE;
+	struct timeval start, end;
+	unsigned long done = 0;
+	unsigned long len = iov->iov_len;
+	void *buf;
+	int ret = 0;
+
+	buf = xmalloc(batch_len);
+	if (!buf)
+		return -1;
+	gettimeofday(&start, NULL);
+
+	while (done < len) {
+		unsigned long chunk = min(len - done, batch_len);
+		unsigned long off = 0;
+
+		if (read_all(ppb->p[0], buf, chunk) != chunk) {
+			pr_perror("Unable to read CUDA staging pages for zero filtering");
+			ret = -1;
+			break;
+		}
+		cuda_staging_zero_stats.pages_scanned += chunk / PAGE_SIZE;
+
+		while (off < chunk) {
+			unsigned long run_start, run_len;
+			struct iovec run_iov;
+
+			if (page_is_all_zero(buf + off)) {
+				cuda_staging_zero_stats.zero_pages++;
+				off += PAGE_SIZE;
+				continue;
+			}
+
+			run_start = off;
+			do {
+				off += PAGE_SIZE;
+			} while (off < chunk &&
+				 !page_is_all_zero(buf + off));
+			run_len = off - run_start;
+
+			run_iov.iov_base = iov->iov_base + done + run_start;
+			run_iov.iov_len = run_len;
+			ret = dump_holes(xfer, pp, cur_hole,
+					 run_iov.iov_base);
+			if (ret)
+				break;
+
+			BUG_ON(run_iov.iov_base < (void *)xfer->offset);
+			run_iov.iov_base -= xfer->offset;
+			pr_debug("\tcuda-z %p - %p\n", run_iov.iov_base,
+				 run_iov.iov_base + run_iov.iov_len);
+
+			if (xfer->write_pagemap(xfer, &run_iov, flags)) {
+				ret = -1;
+				break;
+			}
+			if (write_all(img_raw_fd(xfer->pi), buf + run_start,
+				      run_len) != run_len) {
+				pr_perror("Unable to write filtered CUDA staging pages");
+				ret = -1;
+				break;
+			}
+			cuda_staging_zero_stats.nonzero_pages +=
+				run_len / PAGE_SIZE;
+		}
+
+		if (ret)
+			break;
+		done += chunk;
+	}
+
+	gettimeofday(&end, NULL);
+	cuda_staging_zero_stats.duration_us +=
+		(end.tv_sec - start.tv_sec) * USEC_PER_SEC +
+		end.tv_usec - start.tv_usec;
+	xfree(buf);
+	return ret;
+}
+
+void page_xfer_cuda_staging_zero_report(void)
+{
+	pr_info("CUDA staging zero filter pages_scanned=%" PRIu64
+		" scanned_bytes=%" PRIu64 " zero_pages_omitted=%" PRIu64
+		" zero_bytes_omitted=%" PRIu64
+		" nonzero_pages_written=%" PRIu64
+		" nonzero_bytes_written=%" PRIu64
+		" duration_us=%" PRIu64 "\n",
+		cuda_staging_zero_stats.pages_scanned,
+		cuda_staging_zero_stats.pages_scanned * PAGE_SIZE,
+		cuda_staging_zero_stats.zero_pages,
+		cuda_staging_zero_stats.zero_pages * PAGE_SIZE,
+		cuda_staging_zero_stats.nonzero_pages,
+		cuda_staging_zero_stats.nonzero_pages * PAGE_SIZE,
+		cuda_staging_zero_stats.duration_us);
+}
+
 static inline u32 ppb_xfer_flags(struct page_xfer *xfer, struct page_pipe_buf *ppb)
 {
 	if (ppb->flags & PPB_LAZY)
@@ -881,6 +1005,7 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 {
 	struct page_pipe_buf *ppb;
 	unsigned int cur_hole = 0;
+	u64 zero_pages_before = cuda_staging_zero_stats.zero_pages;
 	int ret;
 
 	pr_debug("Transferring pages:\n");
@@ -893,6 +1018,17 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 		for (i = 0; i < ppb->nr_segs; i++) {
 			struct iovec iov = ppb->iov[i];
 			u32 flags;
+
+			flags = ppb_xfer_flags(xfer, ppb);
+			if (ppb->flags & PPB_CUDA_STAGING_ZERO) {
+				BUG_ON(opts.use_page_server);
+				BUG_ON(!(flags & PE_PRESENT));
+				ret = dump_cuda_staging_filtered_iov(
+					xfer, pp, ppb, &iov, flags, &cur_hole);
+				if (ret)
+					return ret;
+				continue;
+			}
 
 			ret = dump_holes(xfer, pp, &cur_hole, iov.iov_base);
 			if (ret)
@@ -911,7 +1047,12 @@ int page_xfer_dump_pages(struct page_xfer *xfer, struct page_pipe *pp)
 		}
 	}
 
-	return dump_holes(xfer, pp, &cur_hole, NULL);
+	ret = dump_holes(xfer, pp, &cur_hole, NULL);
+	if (!ret && cuda_staging_zero_stats.zero_pages > zero_pages_before)
+		cnt_sub(CNT_PAGES_WRITTEN,
+			cuda_staging_zero_stats.zero_pages -
+				zero_pages_before);
+	return ret;
 }
 
 /*

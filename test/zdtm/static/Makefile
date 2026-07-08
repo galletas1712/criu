@@ -193,6 +193,7 @@ TST_NOFILE	:=				\
 		unhashed_proc			\
 		cow00				\
 		cow02				\
+		cuda_staging_zero		\
 		child_opened_proc		\
 		posix_timers			\
 		sigpending			\

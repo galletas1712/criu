@@ -2248,6 +2248,8 @@ int cr_dump_tasks(pid_t pid)
 		if (dump_one_task(item, parent_ie))
 			goto err;
 	}
+	if (cuda_staging_zero_skip_finish())
+		goto err;
 
 	ret = run_plugins(DUMP_DEVICES_LATE, pid);
 	if (ret && ret != -ENOTSUP)

@@ -39,6 +39,232 @@
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
 
+#define CUDA_STAGING_MIN_SIZE (2ULL << 30)
+#define CUDA_STAGING_MAX_SIZE (4ULL << 30)
+
+static struct {
+	bool initialized;
+	bool enabled;
+	bool has_exact_size;
+	bool has_expected_count;
+	bool has_expected_bytes;
+	u64 exact_size;
+	u64 expected_count;
+	u64 expected_bytes;
+	u64 candidate_count;
+	u64 candidate_bytes;
+	u64 filtered_count;
+	u64 filtered_bytes;
+} cuda_staging_zero;
+
+static int parse_cuda_staging_env_u64(const char *name, u64 *value, bool *present)
+{
+	const char *str = getenv(name);
+	unsigned long long parsed;
+	char *end;
+
+	if (!str) {
+		*present = false;
+		return 0;
+	}
+
+	errno = 0;
+	parsed = strtoull(str, &end, 10);
+	if (errno || end == str || *end) {
+		pr_err("Invalid %s value: %s\n", name, str);
+		return -1;
+	}
+
+	*value = parsed;
+	*present = true;
+	return 0;
+}
+
+static int cuda_staging_zero_init(void)
+{
+	const char *enabled;
+
+	if (cuda_staging_zero.initialized)
+		return 0;
+
+	cuda_staging_zero.initialized = true;
+	enabled = getenv("CRIU_CUDA_STAGING_ZERO_SKIP");
+	if (!enabled || !strcmp(enabled, "0"))
+		return 0;
+	if (strcmp(enabled, "1")) {
+		pr_err("CRIU_CUDA_STAGING_ZERO_SKIP must be 0 or 1\n");
+		return -1;
+	}
+
+	cuda_staging_zero.enabled = true;
+	if (parse_cuda_staging_env_u64("CRIU_CUDA_STAGING_ZERO_SKIP_SIZE",
+				       &cuda_staging_zero.exact_size,
+				       &cuda_staging_zero.has_exact_size) ||
+	    parse_cuda_staging_env_u64("CRIU_CUDA_STAGING_ZERO_SKIP_EXPECT_COUNT",
+				       &cuda_staging_zero.expected_count,
+				       &cuda_staging_zero.has_expected_count) ||
+	    parse_cuda_staging_env_u64("CRIU_CUDA_STAGING_ZERO_SKIP_EXPECT_BYTES",
+				       &cuda_staging_zero.expected_bytes,
+				       &cuda_staging_zero.has_expected_bytes))
+		return -1;
+
+	if (cuda_staging_zero.has_exact_size &&
+	    (!cuda_staging_zero.exact_size ||
+	     cuda_staging_zero.exact_size % PAGE_SIZE)) {
+		pr_err("CRIU_CUDA_STAGING_ZERO_SKIP_SIZE must be page-aligned and nonzero\n");
+		return -1;
+	}
+
+	pr_info("CUDA staging zero filter enabled exact_size_set=%d"
+		" exact_size=%" PRIu64 " min_size=%llu max_size=%llu"
+		" expected_count_set=%d expected_count=%" PRIu64
+		" expected_bytes_set=%d expected_bytes=%" PRIu64 "\n",
+		cuda_staging_zero.has_exact_size,
+		cuda_staging_zero.exact_size, CUDA_STAGING_MIN_SIZE,
+		CUDA_STAGING_MAX_SIZE,
+		cuda_staging_zero.has_expected_count,
+		cuda_staging_zero.expected_count,
+		cuda_staging_zero.has_expected_bytes,
+		cuda_staging_zero.expected_bytes);
+	return 0;
+}
+
+static bool cuda_staging_guard_vma(const struct vma_area *vma, u64 min_size)
+{
+	return vma->e->prot == PROT_NONE &&
+	       vma_area_len(vma) >= min_size &&
+	       vma->e->status == (VMA_AREA_REGULAR | VMA_ANON_PRIVATE |
+				  VMA_AREA_NOT_ACCOUNTABLE) &&
+	       vma->e->flags == (MAP_PRIVATE | MAP_ANONYMOUS);
+}
+
+static bool cuda_staging_size_matches(const struct vma_area *vma)
+{
+	u64 size = vma_area_len(vma);
+
+	if (cuda_staging_zero.has_exact_size)
+		return size == cuda_staging_zero.exact_size;
+
+	return size >= CUDA_STAGING_MIN_SIZE && size <= CUDA_STAGING_MAX_SIZE;
+}
+
+static bool cuda_staging_candidate_vma(const struct vma_area *vma)
+{
+	return vma->e->prot == (PROT_READ | PROT_WRITE) &&
+	       vma->e->status == (VMA_AREA_REGULAR | VMA_ANON_PRIVATE) &&
+	       vma->e->flags == (MAP_PRIVATE | MAP_ANONYMOUS) &&
+	       cuda_staging_size_matches(vma);
+}
+
+static int find_cuda_staging_vma(pid_t pid, struct vm_area_list *vmas,
+				 bool filter_allowed,
+				 struct vma_area **staging_vma)
+{
+	struct vma_area *vma;
+	unsigned int candidates = 0;
+
+	*staging_vma = NULL;
+	if (cuda_staging_zero_init())
+		return -1;
+	if (!cuda_staging_zero.enabled)
+		return 0;
+
+	list_for_each_entry(vma, &vmas->h, list) {
+		struct vma_area *prev, *next;
+		bool prev_ok, next_ok;
+
+		if (vma_area_is(vma, VMA_AREA_GUARD) ||
+		    !cuda_staging_candidate_vma(vma))
+			continue;
+
+		candidates++;
+		if (candidates > 1) {
+			pr_err("CUDA staging zero filter pid=%d has multiple candidate mappings\n",
+			       pid);
+			return -1;
+		}
+
+		if (list_is_first(&vma->list, &vmas->h) ||
+		    list_is_last(&vma->list, &vmas->h)) {
+			pr_err("CUDA staging zero filter pid=%d candidate %#" PRIx64
+			       "-%#" PRIx64 " is at a VMA list boundary\n",
+			       pid, vma->e->start, vma->e->end);
+			return -1;
+		}
+
+		prev = list_entry(vma->list.prev, struct vma_area, list);
+		next = list_entry(vma->list.next, struct vma_area, list);
+		prev_ok = !vma_area_is(prev, VMA_AREA_GUARD) &&
+			  prev->e->end == vma->e->start &&
+			  vma_area_len(prev) == PAGE_SIZE &&
+			  cuda_staging_guard_vma(prev, PAGE_SIZE);
+		next_ok = !vma_area_is(next, VMA_AREA_GUARD) &&
+			  vma->e->end == next->e->start &&
+			  cuda_staging_guard_vma(next, PAGE_SIZE);
+		if (!prev_ok || !next_ok) {
+			pr_err("CUDA staging zero filter pid=%d candidate %#" PRIx64
+			       "-%#" PRIx64
+			       " failed guard validation prev_ok=%d next_ok=%d\n",
+			       pid, vma->e->start, vma->e->end,
+			       prev_ok, next_ok);
+			return -1;
+		}
+
+		cuda_staging_zero.candidate_count++;
+		cuda_staging_zero.candidate_bytes += vma_area_len(vma);
+		if (filter_allowed) {
+			*staging_vma = vma;
+			cuda_staging_zero.filtered_count++;
+			cuda_staging_zero.filtered_bytes += vma_area_len(vma);
+		}
+		pr_info("CUDA staging zero filter candidate pid=%d start=%#" PRIx64
+			" end=%#" PRIx64 " bytes=%" PRIu64
+			" prev_guard_bytes=%" PRIu64
+			" next_guard_bytes=%" PRIu64 " filtered=%d\n",
+			pid, vma->e->start, vma->e->end,
+			vma_entry_len(vma->e), vma_entry_len(prev->e),
+			vma_entry_len(next->e), filter_allowed);
+	}
+
+	return 0;
+}
+
+int cuda_staging_zero_skip_finish(void)
+{
+	if (cuda_staging_zero_init())
+		return -1;
+	if (!cuda_staging_zero.enabled)
+		return 0;
+
+	pr_info("CUDA staging zero filter candidates=%" PRIu64
+		" candidate_bytes=%" PRIu64 " filtered=%" PRIu64
+		" filtered_bytes=%" PRIu64 "\n",
+		cuda_staging_zero.candidate_count,
+		cuda_staging_zero.candidate_bytes,
+		cuda_staging_zero.filtered_count,
+		cuda_staging_zero.filtered_bytes);
+	page_xfer_cuda_staging_zero_report();
+
+	if (cuda_staging_zero.has_expected_count &&
+	    cuda_staging_zero.filtered_count != cuda_staging_zero.expected_count) {
+		pr_err("CUDA staging zero filter expected %" PRIu64
+		       " mappings, filtered %" PRIu64 "\n",
+		       cuda_staging_zero.expected_count,
+		       cuda_staging_zero.filtered_count);
+		return -1;
+	}
+	if (cuda_staging_zero.has_expected_bytes &&
+	    cuda_staging_zero.filtered_bytes != cuda_staging_zero.expected_bytes) {
+		pr_err("CUDA staging zero filter expected %" PRIu64
+		       " bytes, filtered %" PRIu64 "\n",
+		       cuda_staging_zero.expected_bytes,
+		       cuda_staging_zero.filtered_bytes);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int task_reset_dirty_track(int pid)
 {
 	int ret;
@@ -221,8 +447,9 @@ static bool is_stack(struct pstree_item *item, unsigned long vaddr)
  * the memory contents is present in the parent image set.
  */
 
-static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
-			 bool has_parent)
+static int generate_iovs(struct pstree_item *item, struct vma_area *vma,
+			 struct page_pipe *pp, pmc_t *pmc, u64 *pvaddr,
+			 bool has_parent, bool cuda_staging_zero_skip)
 {
 	unsigned long nr_scanned;
 	unsigned long pages[3] = {};
@@ -249,6 +476,8 @@ static int generate_iovs(struct pstree_item *item, struct vma_area *vma, struct 
 
 		if (vma_entry_can_be_lazy(vma->e) && !is_stack(item, vaddr))
 			ppb_flags |= PPB_LAZY;
+		if (cuda_staging_zero_skip)
+			ppb_flags |= PPB_CUDA_STAGING_ZERO;
 
 		/*
 		 * If we're doing incremental dump (parent images
@@ -416,7 +645,9 @@ static int detect_pid_reuse(struct pstree_item *item, struct proc_pid_stat *pps,
 
 static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, struct page_pipe *pp,
 			     struct page_xfer *xfer, struct parasite_dump_pages_args *args, struct parasite_ctl *ctl,
-			     pmc_t *pmc, bool has_parent, bool pre_dump, int parent_predump_mode)
+			     pmc_t *pmc, bool has_parent, bool pre_dump,
+			     int parent_predump_mode,
+			     struct vma_area *cuda_staging_vma)
 {
 	u64 vaddr;
 	int ret;
@@ -509,7 +740,8 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 		return add_shmem_area(item->pid->real, vma->e, pmc);
 	vaddr = vma->e->start;
 again:
-	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent);
+	ret = generate_iovs(item, vma, pp, pmc, &vaddr, has_parent,
+			    vma == cuda_staging_vma);
 	if (ret == -EAGAIN) {
 		BUG_ON(!(pp->flags & PP_CHUNK_MODE));
 
@@ -539,6 +771,7 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	int possible_pid_reuse = 0;
 	bool has_parent;
 	int parent_predump_mode = -1;
+	struct vma_area *cuda_staging_vma;
 
 	pr_info("\n");
 	pr_info("Dumping pages (type: %d pid: %d)\n", CR_FD_PAGES, item->pid->real);
@@ -600,13 +833,20 @@ static int __parasite_dump_pages_seized(struct pstree_item *item, struct parasit
 	has_parent = !!xfer.parent && !possible_pid_reuse;
 	if (mdc->parent_ie)
 		parent_predump_mode = mdc->parent_ie->pre_dump_mode;
+	ret = find_cuda_staging_vma(item->pid->real, vma_area_list,
+				    !has_parent && !mdc->pre_dump &&
+					    !mdc->lazy && !opts.track_mem &&
+					    !opts.use_page_server,
+				    &cuda_staging_vma);
+	if (ret)
+		goto out_xfer;
 
 	list_for_each_entry(vma_area, &vma_area_list->h, list) {
 		if (vma_area_is(vma_area, VMA_AREA_GUARD))
 			continue;
 
 		ret = generate_vma_iovs(item, vma_area, pp, &xfer, args, ctl, &pmc, has_parent, mdc->pre_dump,
-					parent_predump_mode);
+					parent_predump_mode, cuda_staging_vma);
 		if (ret < 0)
 			goto out_xfer;
 	}
